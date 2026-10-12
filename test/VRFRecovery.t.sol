@@ -180,7 +180,7 @@ contract VRFRecoveryTest is Test {
 
     function test_RecoveryFromAnotherLaneOrSubscription() public {
         uint256 first = pass.requestSeed();
-        vm.warp(block.timestamp + timeout);
+        // No wait is needed: the timeout is per subscription, and this one has none pending.
         uint256 otherSub = 777;
         vm.prank(keeper);
         uint256 second = pass.requestSeedWith(otherSub, OTHER_LANE);
@@ -191,6 +191,106 @@ contract VRFRecoveryTest is Test {
         assertEq(pass.seed(), 9);
         assertTrue(vrf.fulfill(first, 8));
         assertEq(pass.seed(), 9);
+    }
+
+    // ------------------------------------------------------------------ foreign subscriptions cannot block
+
+    /// @dev Independent review finding 2d181f82: a stranger's unfunded subscription used to arm the single
+    ///      36-hour lock and keep `requestSeed()` out. The timeout is now per subscription.
+    function test_UnfundedForeignSubscriptionNeverBlocksTheConfiguredSubscription() public {
+        address griefer = makeAddr("griefer");
+        uint256 grieferSub = 4242;
+        for (uint256 cycle = 0; cycle < 3; cycle++) {
+            // The griefer is first in the block in which a request becomes possible.
+            vm.prank(griefer);
+            uint256 foreign = pass.requestSeedWith(grieferSub, KEY_HASH);
+            (,,,, uint256 sub,,) = vrf.requests(foreign);
+            assertEq(sub, grieferSub);
+            assertEq(pass.lastSeedRequestAtOf(grieferSub), block.timestamp);
+
+            // Same block: the keeper's request from the configured subscription goes through.
+            vm.prank(keeper);
+            uint256 configured = pass.requestSeed();
+            (,,,, sub,,) = vrf.requests(configured);
+            assertEq(sub, SUB_ID, "request charged to the configured subscription");
+            assertEq(pass.lastSeedRequestAt(), block.timestamp);
+            assertTrue(pass.isSeedRequest(configured));
+
+            // The foreign request is never fulfilled (no balance). The configured one would be, but
+            // assume it fails too so the next cycle is reached.
+            assertFalse(vrf.fulfillWithGas(configured, 1, 5_000));
+            assertFalse(pass.seedSet());
+            vm.warp(block.timestamp + timeout);
+        }
+        assertEq(pass.seedRequestCount(), 6, "three foreign and three configured requests, none blocked");
+        // The configured subscription's own request is what finally delivers.
+        vm.prank(keeper);
+        uint256 last = pass.requestSeed();
+        assertTrue(vrf.fulfill(last, 77));
+        assertEq(pass.seed(), 77);
+        assertEq(pass.seedRequestId(), last);
+    }
+
+    function test_TimeoutIsEnforcedPerSubscription() public {
+        uint256 otherSub = 777;
+        uint256 first = pass.requestSeed();
+        // The configured subscription is rate-limited against itself ...
+        vm.expectRevert(
+            abi.encodeWithSelector(BMCIlluminatiPass.SeedRequestPending.selector, block.timestamp + timeout)
+        );
+        pass.requestSeed();
+        // ... a foreign subscription is not delayed by it, and is rate-limited against itself only.
+        vm.prank(keeper);
+        uint256 second = pass.requestSeedWith(otherSub, KEY_HASH);
+        vm.prank(keeper);
+        vm.expectRevert(
+            abi.encodeWithSelector(BMCIlluminatiPass.SeedRequestPending.selector, block.timestamp + timeout)
+        );
+        pass.requestSeedWith(otherSub, KEY_HASH);
+        vm.prank(alice);
+        uint256 third = pass.requestSeedWith(999, OTHER_LANE);
+        assertEq(pass.seedRequestCount(), 3);
+        assertEq(pass.seedRequestAvailableAt(), block.timestamp + timeout, "view reports the configured subscription");
+        // A foreign request can still be the one that delivers: first delivered word wins.
+        assertTrue(vrf.fulfill(second, 2));
+        assertEq(pass.seed(), 2);
+        assertTrue(vrf.fulfill(first, 1));
+        assertTrue(vrf.fulfill(third, 3));
+        assertEq(pass.seed(), 2);
+        // Once set, every path is closed for every subscription.
+        vm.warp(block.timestamp + timeout);
+        vm.expectRevert(BMCIlluminatiPass.SeedAlreadyDelivered.selector);
+        pass.requestSeedWith(otherSub, KEY_HASH);
+    }
+
+    function test_StrangerCannotMoveTheConfiguredSubscriptionToAnotherLane() public {
+        // While the default lane is registered, the configured subscription only requests on it.
+        vm.prank(keeper);
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.DefaultLaneStillRegistered.selector, KEY_HASH));
+        pass.requestSeedWith(SUB_ID, OTHER_LANE);
+        assertEq(vrf.requestCount(), 0);
+        assertEq(pass.lastSeedRequestAt(), 0);
+        // `requestSeedWith` on the configured subscription and lane is the same request as `requestSeed`.
+        vm.prank(keeper);
+        uint256 req = pass.requestSeedWith(SUB_ID, KEY_HASH);
+        (,,, bytes32 kh, uint256 sub,,) = vrf.requests(req);
+        assertEq(kh, KEY_HASH);
+        assertEq(sub, SUB_ID);
+        vm.expectRevert(
+            abi.encodeWithSelector(BMCIlluminatiPass.SeedRequestPending.selector, block.timestamp + timeout)
+        );
+        pass.requestSeed();
+        // Another lane at a stranger's own cost is always fine.
+        vm.prank(keeper);
+        pass.requestSeedWith(777, OTHER_LANE);
+        // Once the coordinator retires the default lane, the configured subscription may use another.
+        vm.warp(block.timestamp + timeout);
+        vrf.setProvingKey(KEY_HASH, false);
+        vm.prank(keeper);
+        uint256 moved = pass.requestSeedWith(SUB_ID, OTHER_LANE);
+        (,,, kh, sub,,) = vrf.requests(moved);
+        assertEq(kh, OTHER_LANE);
+        assertEq(sub, SUB_ID);
     }
 
     function test_UnregisteredLaneIsRefusedBeforeAnyRequest() public {

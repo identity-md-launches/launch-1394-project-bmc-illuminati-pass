@@ -486,13 +486,16 @@ contract BMCIlluminatiPassTest is Test {
         _finishPhase1();
         uint256 t0 = block.timestamp;
         assertEq(pass.lastMintAt(), t0);
-        assertEq(pass.seedRequestAvailableAt(), t0 + 30 days);
+        assertEq(pass.seedRequestAvailableAt(), 0, "no mystery token yet: the close time cannot be predicted");
         vm.warp(t0 + 30 days - 1);
         assertFalse(pass.saleClosed());
-        _mintMysteryAs(alice); // resets the idle clock
+        _mintMysteryAs(alice); // the first mystery mint starts the idle clock
         uint256 t1 = block.timestamp;
+        assertEq(pass.seedRequestAvailableAt(), t1 + 30 days);
         vm.warp(t0 + 30 days);
         assertFalse(pass.saleClosed(), "mint one second before the deadline keeps the sale open");
+        vm.warp(t1 + 30 days - 1);
+        assertFalse(pass.saleClosed());
         vm.warp(t1 + 30 days);
         assertTrue(pass.saleClosed());
         assertEq(pass.currentPrice(), 0);
@@ -517,12 +520,35 @@ contract BMCIlluminatiPassTest is Test {
         assertEq(vrf.requestCount(), 0);
     }
 
-    function test_SeedRequestRevertsWithoutMysteryTokens() public {
+    /// @dev The idle clock does not start at the 40th Genesis mint: with no mystery token the sale
+    ///      cannot close, nothing can be requested, and the first mystery mint is still possible after
+    ///      any gap. A closed sale therefore always has something to reveal.
+    function test_IdleTimeDoesNotCloseTheSaleBeforeTheFirstMysteryMint() public {
         _finishPhase1();
-        _closeSaleByIdle();
-        vm.expectRevert(BMCIlluminatiPass.NothingToReveal.selector);
+        uint256 t0 = block.timestamp;
+        vm.warp(t0 + 400 days);
+        assertFalse(pass.saleClosed());
+        assertEq(pass.seedRequestAvailableAt(), 0, "the view promises nothing while no request can succeed");
+        assertEq(pass.currentPrice(), MYSTERY_PRICE);
+        assertEq(pass.remainingMysteryMints(), 460);
+        vm.expectRevert(BMCIlluminatiPass.SaleNotClosed.selector);
         pass.requestSeed();
+        vm.expectRevert(BMCIlluminatiPass.SaleNotClosed.selector);
+        pass.requestSeedWith(SUB_ID, KEY_HASH);
+        assertEq(vrf.requestCount(), 0);
         assertEq(pass.finalizeReveals(10), 0);
+
+        // The mystery phase starts whenever the first buyer arrives; its mint starts the clock.
+        uint256 id = _mintMysteryAs(alice);
+        assertEq(id, 41);
+        uint256 t1 = block.timestamp;
+        assertEq(pass.seedRequestAvailableAt(), t1 + 30 days);
+        vm.warp(t1 + 30 days - 1);
+        assertFalse(pass.saleClosed());
+        vm.warp(t1 + 30 days);
+        assertTrue(pass.saleClosed());
+        assertEq(pass.seedRequestAvailableAt(), t1 + 30 days);
+        pass.requestSeed();
     }
 
     // ------------------------------------------------------------------ seed and reveal

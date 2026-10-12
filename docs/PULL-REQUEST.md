@@ -22,15 +22,26 @@ Standard, prices 1,000,000 / 350,000 BMC, permanent burning through `burnFrom`.
   `requestSeedWith()`; minimal callback storing the first word; outcomes derived from the seed;
   `finalizeReveals` materializes only. Owner has no on-chain power.
 - `src/MysteryDraw.sol`: seed-driven Fisher-Yates draw, same semantics as `BMCPassVRFPrototype.draw`.
-- Tests: 68 (failed callbacks, expired requests, recovery, overlapping requests, lane and subscription
-  fallback, rarity fairness, 500-NFT distribution, Chainlink mock with native funding, mainnet fork
-  for real `burnFrom` and coordinator configuration). Logs in `docs/TEST-RESULTS.md`.
+- Tests: 72 (failed callbacks, expired requests, recovery, overlapping requests, foreign
+  subscriptions racing the configured one, lane and subscription fallback, idle rule with no mystery
+  token, rarity fairness, 500-NFT distribution, Chainlink mock with native funding, mainnet fork for
+  real `burnFrom` and coordinator configuration). Logs in `docs/TEST-RESULTS.md`.
 - `website/`: sale and seed status, request-seed button, updated copy.
 - Docs: `ADAPTATION.md`, `docs/SECURITY-REVIEW.md`, `docs/READINESS.md`, `README.md`.
 
+## Revision after the independent review
+
+- Per-subscription re-request timeout (`lastSeedRequestAtOf`): a stranger's unfunded subscription can
+  no longer block `requestSeed()` (reviewer proof passes). The configured subscription can only be
+  moved to another lane once the coordinator retires its default lane.
+- The 30-day idle rule starts at the first mystery mint, not at the 40th Genesis mint, so a quiet
+  month between the phases cannot end the sale with nothing to reveal. `seedRequestAvailableAt()`
+  returns 0 while it cannot be predicted.
+- Residual risk 9 (public-mempool window before fulfilment) documented, with holder guidance.
+
 ## Verification
 
-- `forge build`, `forge test`: 65 passed, 3 skipped (fork tests without RPC), 0 failed.
+- `forge build`, `forge test`: 69 passed, 3 skipped (fork tests without RPC), 0 failed.
 - `MAINNET_RPC_URL=… forge test --match-contract BMCMainnetForkTest`: 3 passed.
 - Launch protected rehearsal with real constructor arguments: passed.
 - Mainnet reads (block 26175546): coordinator, three registered key hashes, subscription state, BMC.

@@ -21,8 +21,8 @@ import {MysteryDraw} from "./MysteryDraw.sol";
 ///  Phase 2 (token ids 41-500): up to 460 mystery mints at 350,000 BMC each. A mystery mint burns BMC
 ///  and mints a pending-reveal NFT. No randomness is requested per mint.
 ///
-///  Single seed. Once the sale is closed (sold out, or `SALE_IDLE_TIMEOUT` without a mint after the
-///  Genesis phase), anyone may request ONE Chainlink VRF v2.5 random word. The first word the
+///  Single seed. Once the sale is closed (sold out, or `SALE_IDLE_TIMEOUT` without a mint once at
+///  least one mystery token exists), anyone may request ONE Chainlink VRF v2.5 random word. The first word the
 ///  coordinator delivers for any request this contract made becomes the seed; every later delivery
 ///  is ignored. All mystery outcomes are a pure function of the seed (`MysteryDraw`): token 41 + i is
 ///  step i of a Fisher-Yates draw without replacement over 37 Genesis (genesis-41 .. genesis-77) and
@@ -32,8 +32,10 @@ import {MysteryDraw} from "./MysteryDraw.sol";
 ///  Recovery. If a request is not fulfilled within `SEED_REQUEST_TIMEOUT` (Chainlink drops underfunded
 ///  requests after 24 hours), anyone may request again, from the configured subscription or from any
 ///  subscription that lists this contract as a consumer, on any gas lane the coordinator has a proving
-///  key for. There is no reroll: a delivery after the seed is set changes nothing, and nothing lets the
-///  owner, a minter or a keeper choose, replace or preview the seed.
+///  key for. The timeout is tracked per subscription: a request charged to one subscription never
+///  delays a request charged to another, so a stranger's unfunded subscription cannot hold the
+///  configured one back. There is no reroll: a delivery after the seed is set changes nothing, and
+///  nothing lets the owner, a minter or a keeper choose, replace or preview the seed.
 ///
 ///  Trust model: the owner has no on-chain power beyond the `Ownable` role itself (useful for
 ///  marketplace collection pages). The images CID, VRF coordinator, subscription id, gas lane and
@@ -82,11 +84,13 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     ///         `artwork/genesis/` through a public gateway on 2026-10-12).
     string public constant GENESIS_IMAGES_CID = "bafybeihfihwwpev4gkqjuqawgtptsv3ynzsokclo6odsolvoa65aqaac2u";
 
-    /// @notice After the Genesis phase, the sale closes once this long passes without any mint.
+    /// @notice Once at least one mystery token exists, the sale closes after this long without any
+    ///         mint. The clock starts at the first mystery mint, not at the 40th Genesis mint, so a
+    ///         quiet period between the phases cannot end the sale with nothing to reveal.
     uint256 public constant SALE_IDLE_TIMEOUT = 30 days;
-    /// @notice A seed request that is still unfulfilled after this long may be re-requested by anyone.
-    ///         Longer than Chainlink's 24-hour pending window, so an honest node has dropped the old
-    ///         request before a new one is opened.
+    /// @notice A seed request that is still unfulfilled after this long may be re-requested by anyone
+    ///         from the same subscription. Longer than Chainlink's 24-hour pending window, so an honest
+    ///         node has dropped the old request before a new one is opened.
     uint256 public constant SEED_REQUEST_TIMEOUT = 36 hours;
 
     /// @dev Chainlink VRF v2.5, Ethereum mainnet: 500 gwei gas lane. Verified on 2026-10-12 against
@@ -117,9 +121,10 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     /// @notice Timestamp of the last mint of either phase.
     uint64 public lastMintAt;
 
-    /// @notice Timestamp of the latest seed request (0 if none yet).
-    uint64 public lastSeedRequestAt;
-    /// @notice Number of seed requests made so far (1 on the happy path).
+    /// @notice Timestamp of the latest seed request charged to each subscription (0 if none yet). The
+    ///         re-request timeout is enforced per subscription, so no subscription can block another.
+    mapping(uint256 subscriptionId => uint64) public lastSeedRequestAtOf;
+    /// @notice Number of seed requests made so far, all subscriptions included (1 on the happy path).
     uint32 public seedRequestCount;
     /// @notice True once the seed is set.
     bool public seedSet;
@@ -157,10 +162,10 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     error SoldOut();
     error SaleIsClosed();
     error SaleNotClosed();
-    error NothingToReveal();
     error SeedAlreadyDelivered();
     error SeedRequestPending(uint256 retryAt);
     error KeyHashNotRegistered(bytes32 keyHash);
+    error DefaultLaneStillRegistered(bytes32 keyHash);
     error UnexpectedTokenDecimals(uint8 actual);
     error BurnMismatch(uint256 expected, uint256 actual);
     error OnlyCoordinator();
@@ -243,10 +248,17 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     // ------------------------------------------------------------------------------------------
 
     /// @notice The sale is closed when sold out, or when `SALE_IDLE_TIMEOUT` has passed without a mint
-    ///         after the Genesis phase. Closing is a pure function of state; no call is needed.
+    ///         once at least one mystery token exists. Closing is a pure function of state; no call is
+    ///         needed. With exactly 40 Genesis minted the sale stays open however long it is idle, so a
+    ///         closed sale always has something to reveal.
     function saleClosed() public view returns (bool) {
         if (totalMinted >= MAX_SUPPLY) return true;
-        return totalMinted >= GENESIS_PHASE_SUPPLY && block.timestamp >= uint256(lastMintAt) + SALE_IDLE_TIMEOUT;
+        return totalMinted > GENESIS_PHASE_SUPPLY && block.timestamp >= uint256(lastMintAt) + SALE_IDLE_TIMEOUT;
+    }
+
+    /// @notice Timestamp of the latest seed request charged to the configured subscription (0 if none).
+    function lastSeedRequestAt() external view returns (uint64) {
+        return lastSeedRequestAtOf[SUBSCRIPTION_ID];
     }
 
     /// @notice Request the single VRF seed from the configured subscription and gas lane. Anyone may
@@ -257,7 +269,10 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
 
     /// @notice Recovery: same as `requestSeed`, but from any subscription that lists this contract as a
     ///         consumer and on any gas lane the coordinator has a proving key for. Lets anyone pay for
-    ///         the seed if the configured subscription or lane is unusable. Same timeout rules apply.
+    ///         the seed if the configured subscription or lane is unusable. The timeout applies per
+    ///         subscription: a request here never delays `requestSeed`. The configured subscription may
+    ///         only leave its lane once the coordinator no longer registers `KEY_HASH`, so a stranger
+    ///         cannot pick a more expensive lane at the configured subscription's cost.
     function requestSeedWith(uint256 subscriptionId, bytes32 keyHash) external returns (uint256 requestId) {
         return _requestSeed(subscriptionId, keyHash, true);
     }
@@ -268,11 +283,15 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
         returns (uint256 requestId)
     {
         if (!saleClosed()) revert SaleNotClosed();
-        if (totalMinted <= GENESIS_PHASE_SUPPLY) revert NothingToReveal();
         if (seedSet) revert SeedAlreadyDelivered();
-        uint256 retryAt = uint256(lastSeedRequestAt) + SEED_REQUEST_TIMEOUT;
-        if (lastSeedRequestAt != 0 && block.timestamp < retryAt) revert SeedRequestPending(retryAt);
+        uint64 lastAt = lastSeedRequestAtOf[subscriptionId];
+        uint256 retryAt = uint256(lastAt) + SEED_REQUEST_TIMEOUT;
+        if (lastAt != 0 && block.timestamp < retryAt) revert SeedRequestPending(retryAt);
         _checkKeyHash(keyHash, strictRegistry);
+        if (subscriptionId == SUBSCRIPTION_ID && keyHash != KEY_HASH) {
+            (, bool defaultExists) = _laneStatus(KEY_HASH);
+            if (defaultExists) revert DefaultLaneStillRegistered(KEY_HASH);
+        }
 
         requestId = VRF_COORDINATOR.requestRandomWords(
             VRFV2PlusClient.RandomWordsRequest({
@@ -286,7 +305,7 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
         );
         require(requestId != 0 && !isSeedRequest[requestId], "duplicate request id");
         isSeedRequest[requestId] = true;
-        lastSeedRequestAt = uint64(block.timestamp);
+        lastSeedRequestAtOf[subscriptionId] = uint64(block.timestamp);
         uint32 attempt = ++seedRequestCount;
         emit SeedRequested(requestId, attempt, subscriptionId, keyHash);
     }
@@ -297,15 +316,20 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     ///      coordinator does not expose the registry (test mocks), the default lane is accepted and the
     ///      recovery path is refused.
     function _checkKeyHash(bytes32 keyHash, bool strict) private view {
-        (bool ok, bytes memory data) =
-            address(VRF_COORDINATOR).staticcall(abi.encodeWithSignature("s_provingKeys(bytes32)", keyHash));
-        bool known = ok && data.length >= 64;
+        (bool known, bool exists) = _laneStatus(keyHash);
         if (known) {
-            (bool exists,) = abi.decode(data, (bool, uint64));
             if (!exists) revert KeyHashNotRegistered(keyHash);
         } else if (strict || keyHash != KEY_HASH) {
             revert KeyHashNotRegistered(keyHash);
         }
+    }
+
+    /// @dev `known` is false when the coordinator does not expose the registry.
+    function _laneStatus(bytes32 keyHash) private view returns (bool known, bool exists) {
+        (bool ok, bytes memory data) =
+            address(VRF_COORDINATOR).staticcall(abi.encodeWithSignature("s_provingKeys(bytes32)", keyHash));
+        known = ok && data.length >= 64;
+        if (known) (exists,) = abi.decode(data, (bool, uint64));
     }
 
     // ------------------------------------------------------------------------------------------
@@ -407,13 +431,15 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
         return GENESIS_IMAGES_CID;
     }
 
-    /// @notice Earliest time at which `requestSeed` can be called (0 when it cannot be predicted yet,
-    ///         i.e. the sale is open and not sold out).
+    /// @notice Earliest time at which `requestSeed` (configured subscription) can be called; 0 when it
+    ///         cannot be predicted yet (no mystery token minted, so the sale cannot close by idle time)
+    ///         or when the seed is already set. Shares its conditions with `saleClosed`.
     function seedRequestAvailableAt() external view returns (uint256) {
         if (seedSet) return 0;
-        if (lastSeedRequestAt != 0) return uint256(lastSeedRequestAt) + SEED_REQUEST_TIMEOUT;
+        uint64 lastAt = lastSeedRequestAtOf[SUBSCRIPTION_ID];
+        if (lastAt != 0) return uint256(lastAt) + SEED_REQUEST_TIMEOUT;
         if (totalMinted >= MAX_SUPPLY) return block.timestamp;
-        if (totalMinted >= GENESIS_PHASE_SUPPLY) return uint256(lastMintAt) + SALE_IDLE_TIMEOUT;
+        if (totalMinted > GENESIS_PHASE_SUPPLY) return uint256(lastMintAt) + SALE_IDLE_TIMEOUT;
         return 0;
     }
 

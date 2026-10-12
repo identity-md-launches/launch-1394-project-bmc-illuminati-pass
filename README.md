@@ -18,7 +18,7 @@ requests a token approval. Deployment goes through the IdentityMD launch factory
 | `src/StandardArt.sol` | Internal library rendering the 423 Standard SVGs and their traits. |
 | `src/interfaces/IBMCToken.sol` | Minimal BMC interface (`burnFrom`, `decimals`, ...). |
 | `script/Deploy.s.sol` | Local rehearsal script; mainnet addresses are constants. Not used by the launch. |
-| `test/` | Foundry tests (68, including a run against Chainlink's official `VRFCoordinatorV2_5Mock` and three mainnet-fork tests). |
+| `test/` | Foundry tests (72, including a run against Chainlink's official `VRFCoordinatorV2_5Mock` and three mainnet-fork tests). |
 | `artwork/genesis/` | The 77 Genesis PNGs, `genesis-01.png` .. `genesis-77.png`. |
 | `artwork/tools/generate_genesis.py` | Deterministic generator for the Genesis PNGs (Pillow). |
 | `website/` | Static mint site "bmc-pass" (no build step, no dependencies). |
@@ -35,8 +35,10 @@ requests a token approval. Deployment goes through the IdentityMD launch factory
 - **Phase 2, ids 41-500.** `mintMystery()` burns 350,000 BMC and mints a pending-reveal NFT. Price is
   identical whatever the result. **No randomness is requested per mint.**
 - **Sale close.** `saleClosed()` is true when all 500 are minted, or when 30 days
-  (`SALE_IDLE_TIMEOUT`) pass without any mint after the Genesis phase. No transaction is needed and
-  nobody can close the sale earlier.
+  (`SALE_IDLE_TIMEOUT`) pass without any mint **once at least one mystery token exists**. The idle
+  clock starts at the first mystery mint, not at the 40th Genesis mint: with exactly 40 minted the
+  sale stays open however long it is idle, so a closed sale always has something to reveal. No
+  transaction is needed and nobody can close the sale earlier.
 - **Seed.** Once the sale is closed, anyone calls `requestSeed()`: one VRF v2.5 request (500,000
   callback gas, 3 confirmations, paid in ETH from the fixed subscription, 500 gwei lane). The
   coordinator's callback stores the first word delivered for any request this contract made.
@@ -50,7 +52,8 @@ requests a token approval. Deployment goes through the IdentityMD launch factory
 - **Totals.** 40 x 1,000,000 + 460 x 350,000 = 201,000,000 BMC maximum burned.
 
 Public views: `ownerOf`, `tierOf`, `artworkIdOf`, `revealStatusOf`, `saleClosed`,
-`seedRequestAvailableAt`, `seedSet`, `seed`, `seedRequestId`, `seedRequestCount`, `totalMinted`,
+`seedRequestAvailableAt` (0 while it cannot be predicted, i.e. no mystery token yet or seed already
+set), `lastSeedRequestAt`, `lastSeedRequestAtOf`, `seedSet`, `seed`, `seedRequestId`, `seedRequestCount`, `totalMinted`,
 `totalSupply`, `remainingSupply`, `remainingMysteryMints`, `pendingReveals`, `remainingMysteryGenesis`,
 `remainingMysteryStandard`, `currentPrice`, `totalBurned`, `tokenURI`, `standardSVG`, `genesisImagesCID`.
 
@@ -59,16 +62,23 @@ Public views: `ownerOf`, `tierOf`, `artworkIdOf`, `revealStatusOf`, `saleClosed`
 Chainlink drops a request it cannot fulfil (for example an unfunded subscription) after about 24
 hours. The contract's rules, all permissionless:
 
-- If no word has arrived 36 hours (`SEED_REQUEST_TIMEOUT`) after the latest request, anyone may call
-  `requestSeed()` again.
+- If no word has arrived 36 hours (`SEED_REQUEST_TIMEOUT`) after the latest request charged to the
+  fixed subscription, anyone may call `requestSeed()` again.
 - `requestSeedWith(subscriptionId, keyHash)` lets anyone pay for the seed from any VRF v2.5
   subscription that lists the pass as a consumer, on any gas lane the coordinator has a proving key
   for (checked on-chain through `s_provingKeys`), should the fixed subscription or lane be unusable.
+  The 36-hour timeout is tracked **per subscription** (`lastSeedRequestAtOf`): a request charged to
+  someone else's subscription, funded or not, never delays `requestSeed()`. The fixed subscription
+  can only be moved to another lane once the coordinator no longer registers the default lane, so a
+  stranger cannot choose a more expensive lane at its expense.
 - **First delivered word wins.** Whichever outstanding request is fulfilled first sets the seed; every
   later or repeated delivery is ignored and logged (`SeedDeliveryIgnored`). Once the seed is set no
   further request is possible.
 - There is no fallback randomness and no owner path. If Chainlink never answers, tokens stay pending;
   this is a stated dependency on Chainlink, bounded by the ability of anyone to fund and re-request.
+- **For holders of pending tokens.** The fulfilment transaction carries the VRF proof, from which the
+  word (and so every outcome) can be computed by anyone watching the public mempool before it is
+  included. Delist pending tokens from the moment a request is outstanding until `seedSet()` is true.
 
 ## Privileged powers
 

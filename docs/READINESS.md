@@ -15,7 +15,7 @@ and ETH funding), and five assumptions to confirm (A1–A5 in `ADAPTATION.md`). 
 
 | Item | Value | Verification |
 | --- | --- | --- |
-| Contract | `BMCIlluminatiPass`, runtime 23,893 bytes (683 under EIP-170), no DELEGATECALL/CALLCODE/SELFDESTRUCT | `forge build --sizes`; launch protected rehearsal passed with the real arguments on an empty chain |
+| Contract | `BMCIlluminatiPass`, runtime 24,107 bytes (469 under EIP-170), no DELEGATECALL/CALLCODE/SELFDESTRUCT | `forge build --sizes`; launch protected rehearsal passed with the real arguments on an empty chain (re-run after the revision) |
 | Constructor | `(initialOwner, bmcToken, vrfCoordinator, subscriptionId)` | 4 static arguments, nonpayable, no external call |
 | `initialOwner` | `$owner` = `0x83027ad9d0d5374335086c539dadd1db983441b0` | Launch rule; owner has no on-chain power |
 | `bmcToken` | `0x38224239f2BDae357D47cb864BC533d7f72dF961` | `name()` "BMC Illuminati", `symbol()` "BMC", `decimals()` 18, supply ~9.907e26, EIP-1967 slot empty, `burnFrom` selector present, no `owner()`/`paused()`; `burnFrom` exercised on a fork at both prices |
@@ -52,8 +52,10 @@ Nothing in this task spent money. The paid steps that follow, each requiring exp
    (covers one fulfilment at the lane cap plus a re-request), adjustable to current gas prices.
 3. **Consumer entry**: one `addConsumer` transaction by the subscription owner (~70k gas).
 
-Scope delivered in this PR: single-seed contract, draw library, recovery mechanism, 68 tests with
-logs, mainnet fork verification, launch rehearsal, documentation and this assessment. Not in scope:
+Scope delivered in this PR: single-seed contract, draw library, recovery mechanism, 72 tests with
+logs, mainnet fork verification, launch rehearsal, documentation and this assessment, plus the
+revision after the independent review (per-subscription timeout, idle rule from the first mystery
+mint, view fix, mempool residual). Not in scope:
 deployment, broadcasting, funding, consumer entry, merging.
 
 ## Owner checklist after deployment
@@ -66,12 +68,16 @@ deployment, broadcasting, funding, consumer entry, merging.
 5. When `saleClosed()` turns true, call `requestSeed()` (anyone can). Then `finalizeReveals(50)`
    until `pendingReveals()` is 0 (anyone can).
 6. If `seedSet()` is still false 36 hours after a request: fund the subscription if needed and call
-   `requestSeed()` again, or `requestSeedWith(<your other subscription>, <registered key hash>)`.
+   `requestSeed()` again, or `requestSeedWith(<your other subscription>, <registered key hash>)` at
+   any time (each subscription has its own 36-hour timeout; nobody else's request delays yours).
+7. Tell holders to delist pending tokens from the request until `seedSet()` is true (the word is
+   visible in the public mempool shortly before it lands; `docs/SECURITY-REVIEW.md` residual 9).
 
 ## What still needs a human decision
 
-- A1 idle window (30 days) and A2 re-request timeout (36 hours) are constants chosen by the
-  contributor because the brief gave none; change them before deployment if wanted.
+- A1 idle window (30 days, counted from the first mystery mint onwards) and A2 re-request timeout
+  (36 hours, per subscription) are constants chosen by the contributor because the brief gave none;
+  change them before deployment if wanted.
 - Whether to use the 200 gwei lane instead of 500 gwei as the default (cheaper minimum funding,
   slower fulfilment when gas is high). Both are registered; the recovery path can use either.
 - Ownership key: a multisig is recommended even though the owner has no on-chain power, because

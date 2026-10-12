@@ -1,0 +1,15 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "BMCIlluminatiPass",
+      "constructorArgs": [
+        "$owner",
+        "0x38224239f2BDae357D47cb864BC533d7f72dF961",
+        "0xD7f86b4b8Cae7D942340FF628F82735b7a20893a",
+        "27852459484169864437638942739291618120641810244677084392617474192083559562985"
+      ]
+    }
+  ],
+  "notes": "One contract on Ethereum mainnet: BMCIlluminatiPass(initialOwner, bmcToken, vrfCoordinator, subscriptionId). MysteryDraw and StandardArt are internal libraries compiled into it, not separate deployments. initialOwner is $owner; the owner has no on-chain power beyond the Ownable role. bmcToken is the BMC Illuminati token (18 decimals, burnFrom). vrfCoordinator is the Chainlink VRF v2.5 coordinator for Ethereum mainnet. subscriptionId is the VRF v2.5 subscription named in the brief, paid in ETH (nativePayment true). Fixed as constants in the source rather than arguments: 500 max supply, 40 sequential Genesis (token 1 Legendary), 37 Mystery Genesis and 423 Standard, prices 1,000,000 and 350,000 BMC, key hash 0x3fd2fec10d06ee8f65e7f2e95f5c56511359ece3f33960ad8a866ae24a8ff10b (500 gwei lane), callback gas limit 500000, 3 request confirmations, 30 day sale idle timeout, 36 hour seed re-request timeout. The constructor makes no external call. After deployment the subscription owner must add the deployed contract as a consumer and fund the subscription with ETH before the sale closes; the launch does neither. Nothing is deployed, broadcast, funded or burned by this manifest."
+}

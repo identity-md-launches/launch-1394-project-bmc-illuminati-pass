@@ -85,10 +85,11 @@ contract SeedGrabber is IERC721Receiver {
 
 /// @notice Inputs the implementation did not necessarily consider: a coordinator returning request
 ///         id 0 or a repeated id, a registry with a different ABI, multi-word deliveries, extreme
-///         seeds, exact timeout boundaries (fuzzed), reverting receivers, requests from inside the
-///         mint callback, a sale that closes with no mystery mint, batch-split independence of the
-///         materialization, the extraArgs encoding and the gas envelope of the callback and of
-///         `finalizeReveals`.
+///         seeds, exact timeout boundaries (fuzzed, per subscription), reverting receivers, requests
+///         from inside the mint callback, a Genesis-only sale idling for decades, many foreign
+///         subscriptions in one block, the configured subscription's lane rule at every registry state,
+///         batch-split independence of the materialization, the extraArgs encoding and the gas envelope
+///         of the callback and of `finalizeReveals`.
 contract VRFEdgeCasesTest is Test {
     MockBMC bmc;
     MockVRFCoordinator vrf;
@@ -347,10 +348,13 @@ contract VRFEdgeCasesTest is Test {
         uint256 lastMint = pass.lastMintAt();
         uint256 t = bound(uint256(elapsed), 0, 2 * pass.SALE_IDLE_TIMEOUT());
         vm.warp(lastMint + t);
-        bool closed = t >= pass.SALE_IDLE_TIMEOUT();
+        // The idle clock only runs once a mystery token exists: with exactly 40 minted the sale stays
+        // open however long it idles.
+        bool closed = n > 0 && t >= pass.SALE_IDLE_TIMEOUT();
         assertEq(pass.saleClosed(), closed);
         assertEq(pass.currentPrice(), closed ? 0 : MYSTERY_PRICE);
         assertEq(pass.remainingMysteryMints(), closed ? 0 : 460 - n);
+        assertEq(pass.seedRequestAvailableAt(), n == 0 ? 0 : lastMint + pass.SALE_IDLE_TIMEOUT());
         bmc.mint(bob, MYSTERY_PRICE);
         vm.startPrank(bob);
         bmc.approve(address(pass), MYSTERY_PRICE);
@@ -359,38 +363,194 @@ contract VRFEdgeCasesTest is Test {
         vm.stopPrank();
         if (closed) {
             assertEq(bmc.balanceOf(bob), MYSTERY_PRICE, "nothing burned once closed");
-            if (n == 0) {
-                vm.expectRevert(BMCIlluminatiPass.NothingToReveal.selector);
-            }
             pass.requestSeed();
+            assertEq(pass.seedRequestCount(), 1);
         } else {
+            assertEq(bmc.balanceOf(bob), 0, "the mint burned while open");
             vm.expectRevert(BMCIlluminatiPass.SaleNotClosed.selector);
             pass.requestSeed();
+            vm.expectRevert(BMCIlluminatiPass.SaleNotClosed.selector);
+            pass.requestSeedWith(777, OTHER_LANE);
+            assertEq(vrf.requestCount(), 0);
         }
     }
 
-    function test_SaleClosingWithNoMysteryMintIsTerminal() public {
-        // Documented rule: 30 idle days right after the Genesis phase close the sale at 40 tokens for
-        // good. No seed is ever needed and no mint can reopen it.
+    /// forge-config: default.fuzz.runs = 128
+    function testFuzz_ExactlyFortyMintedNeverClosesByIdleTime(uint64 elapsed) public {
+        // With no mystery token there is nothing to reveal, so no idle period, however long, may close
+        // the sale or let anyone open a VRF request on either path. The first mystery mint, whenever it
+        // arrives, is what starts the 30-day clock.
         _finishPhase1();
-        _closeByIdle(pass);
+        uint256 t = bound(uint256(elapsed), 0, 200 * 365 days);
+        vm.warp(block.timestamp + t);
+        assertFalse(pass.saleClosed());
         assertEq(pass.totalMinted(), 40);
-        assertEq(pass.remainingSupply(), 460, "460 ids are never minted");
-        assertEq(pass.remainingMysteryMints(), 0);
-        assertEq(pass.pendingReveals(), 0);
-        vm.expectRevert(BMCIlluminatiPass.NothingToReveal.selector);
+        assertEq(pass.remainingMysteryMints(), 460);
+        assertEq(pass.currentPrice(), MYSTERY_PRICE);
+        assertEq(pass.seedRequestAvailableAt(), 0, "no close time can be promised yet");
+        vm.expectRevert(BMCIlluminatiPass.SaleNotClosed.selector);
         pass.requestSeed();
-        vm.expectRevert(BMCIlluminatiPass.NothingToReveal.selector);
-        pass.requestSeedWith(SUB_ID, OTHER_LANE);
-        assertEq(pass.seedRequestAvailableAt(), pass.lastMintAt() + 30 days, "reported even though nothing to reveal");
-        bmc.mint(alice, MYSTERY_PRICE);
-        vm.startPrank(alice);
-        bmc.approve(address(pass), MYSTERY_PRICE);
-        vm.expectRevert(BMCIlluminatiPass.SaleIsClosed.selector);
-        pass.mintMystery();
-        vm.stopPrank();
-        vm.warp(block.timestamp + 365 days);
+        vm.expectRevert(BMCIlluminatiPass.SaleNotClosed.selector);
+        pass.requestSeedWith(777, OTHER_LANE);
+        vm.expectRevert(BMCIlluminatiPass.SaleNotClosed.selector);
+        pass.requestSeedWith(SUB_ID, KEY_HASH);
+        assertEq(vrf.requestCount(), 0);
+
+        assertEq(_mintMysteryOn(pass, alice), 41);
+        uint256 t1 = block.timestamp;
+        assertEq(pass.seedRequestAvailableAt(), t1 + pass.SALE_IDLE_TIMEOUT());
+        vm.warp(t1 + pass.SALE_IDLE_TIMEOUT() - 1);
+        assertFalse(pass.saleClosed());
+        vm.warp(t1 + pass.SALE_IDLE_TIMEOUT());
         assertTrue(pass.saleClosed());
+        assertEq(pass.requestSeed(), 1000);
+    }
+
+    // ------------------------------------------------------------------ per-subscription timeouts
+
+    /// forge-config: default.fuzz.runs = 256
+    function testFuzz_TimeoutIsKeyedBySubscriptionOnly(uint256 subA, uint256 subB, uint64 lateness) public {
+        // Two foreign subscriptions: the second request is delayed by the first exactly when it is the
+        // same subscription, whatever the lane; and re-requesting is allowed at the boundary, not before.
+        subA = bound(subA, 1, type(uint256).max);
+        subB = bound(subB, 1, type(uint256).max);
+        if (subA == SUB_ID) subA = 1;
+        if (subB == SUB_ID) subB = 2;
+        _finishPhase1();
+        _mintMysteryOn(pass, alice);
+        _closeByIdle(pass);
+        uint256 t0 = block.timestamp;
+        vm.prank(alice);
+        uint256 first = pass.requestSeedWith(subA, KEY_HASH);
+        assertEq(pass.lastSeedRequestAtOf(subA), t0);
+        assertEq(pass.lastSeedRequestAt(), 0, "a foreign request never touches the configured clock");
+        assertEq(pass.seedRequestAvailableAt(), t0, "the configured subscription may still request now");
+
+        uint256 t = bound(uint256(lateness), 0, 2 * pass.SEED_REQUEST_TIMEOUT());
+        vm.warp(t0 + t);
+        bool sameSub = subA == subB;
+        bool blocked = sameSub && t < pass.SEED_REQUEST_TIMEOUT();
+        vm.prank(bob);
+        if (blocked) {
+            vm.expectRevert(
+                abi.encodeWithSelector(BMCIlluminatiPass.SeedRequestPending.selector, t0 + pass.SEED_REQUEST_TIMEOUT())
+            );
+        }
+        uint256 second = pass.requestSeedWith(subB, OTHER_LANE);
+        if (blocked) {
+            assertEq(pass.seedRequestCount(), 1);
+            assertEq(pass.lastSeedRequestAtOf(subA), t0);
+        } else {
+            assertTrue(second != first);
+            assertEq(pass.seedRequestCount(), 2);
+            assertEq(pass.lastSeedRequestAtOf(subB), block.timestamp);
+            if (!sameSub) assertEq(pass.lastSeedRequestAtOf(subA), t0, "another subscription's clock is untouched");
+        }
+        // Whatever happened above, the configured subscription is not delayed by any of it.
+        uint256 configured = pass.requestSeed();
+        assertTrue(pass.isSeedRequest(configured));
+        assertEq(pass.lastSeedRequestAt(), block.timestamp);
+        // Any outstanding request may deliver; the first one does, the others are ignored.
+        assertTrue(vrf.fulfill(first, 11));
+        assertEq(pass.seed(), 11);
+        assertEq(pass.seedRequestId(), first);
+        assertTrue(vrf.fulfill(configured, 22));
+        assertEq(pass.seed(), 11);
+    }
+
+    function test_ManyForeignSubscriptionsInOneBlockAreHarmless() public {
+        // Nothing bounds how many subscriptions request in the same block (the coordinator admits
+        // unfunded ones; it only charges at fulfilment). The contract records each, none delays the
+        // configured subscription, and the first delivery of any of them is the only one that counts.
+        _finishPhase1();
+        _mintMysteryOn(pass, alice);
+        _mintMysteryOn(pass, bob);
+        _closeByIdle(pass);
+        uint256 n = 25;
+        uint256[] memory ids = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            vm.prank(address(uint160(0x7000 + i)));
+            ids[i] = pass.requestSeedWith(1_000 + i, i % 2 == 0 ? KEY_HASH : OTHER_LANE);
+            assertTrue(pass.isSeedRequest(ids[i]));
+            assertEq(pass.lastSeedRequestAtOf(1_000 + i), block.timestamp);
+        }
+        assertEq(pass.seedRequestCount(), n);
+        assertEq(vrf.requestCount(), n);
+        assertEq(pass.lastSeedRequestAt(), 0);
+        assertEq(pass.seedRequestAvailableAt(), block.timestamp);
+        // Repeating any of them in the same block is refused for that subscription only.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BMCIlluminatiPass.SeedRequestPending.selector, block.timestamp + pass.SEED_REQUEST_TIMEOUT()
+            )
+        );
+        pass.requestSeedWith(1_000, OTHER_LANE);
+        uint256 configured = pass.requestSeed();
+        assertEq(pass.seedRequestCount(), n + 1);
+        // Unfunded foreign requests never deliver (the coordinator reverts at fulfilment); the
+        // configured one does, and a foreign one landing later changes nothing.
+        assertTrue(vrf.fulfill(configured, 5));
+        assertEq(pass.seed(), 5);
+        assertEq(pass.seedRequestId(), configured);
+        bytes32 before =
+            keccak256(abi.encode(pass.tierOf(41), pass.artworkIdOf(41), pass.tierOf(42), pass.artworkIdOf(42)));
+        for (uint256 i = 0; i < n; i++) {
+            assertTrue(vrf.fulfill(ids[i], 1_000_000 + i));
+        }
+        assertEq(pass.seed(), 5);
+        assertEq(
+            keccak256(abi.encode(pass.tierOf(41), pass.artworkIdOf(41), pass.tierOf(42), pass.artworkIdOf(42))), before
+        );
+        // And once set, every subscription is closed off.
+        vm.warp(block.timestamp + pass.SEED_REQUEST_TIMEOUT());
+        vm.expectRevert(BMCIlluminatiPass.SeedAlreadyDelivered.selector);
+        pass.requestSeedWith(9_999, KEY_HASH);
+    }
+
+    function test_ConfiguredSubscriptionLaneRuleAtTheRegistryEdges() public {
+        _finishPhase1();
+        _mintMysteryOn(pass, alice);
+        _closeByIdle(pass);
+        // Both lanes registered: the configured subscription is pinned to its lane, whoever calls.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.DefaultLaneStillRegistered.selector, KEY_HASH));
+        pass.requestSeedWith(SUB_ID, OTHER_LANE);
+        // An unregistered lane is reported as such before the pin rule (nothing can be requested on it).
+        bytes32 bogus = bytes32(uint256(KEY_HASH) + 1);
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.KeyHashNotRegistered.selector, bogus));
+        pass.requestSeedWith(SUB_ID, bogus);
+        // Registry hidden: the strict path refuses even the configured lane and the configured
+        // subscription cannot move either; only `requestSeed` on the default lane is possible.
+        vrf.setHideRegistry(true);
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.KeyHashNotRegistered.selector, KEY_HASH));
+        pass.requestSeedWith(SUB_ID, KEY_HASH);
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.KeyHashNotRegistered.selector, OTHER_LANE));
+        pass.requestSeedWith(SUB_ID, OTHER_LANE);
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.KeyHashNotRegistered.selector, OTHER_LANE));
+        pass.requestSeedWith(777, OTHER_LANE);
+        assertEq(vrf.requestCount(), 0);
+        assertEq(pass.lastSeedRequestAt(), 0, "refused requests never start a clock");
+        vrf.setHideRegistry(false);
+        // Default lane retired: the configured subscription may leave it, and only then.
+        vrf.setProvingKey(KEY_HASH, false);
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.KeyHashNotRegistered.selector, KEY_HASH));
+        pass.requestSeed();
+        vm.prank(bob);
+        uint256 moved = pass.requestSeedWith(SUB_ID, OTHER_LANE);
+        (,,, bytes32 kh, uint256 sub,,) = vrf.requests(moved);
+        assertEq(kh, OTHER_LANE);
+        assertEq(sub, SUB_ID);
+        assertEq(pass.lastSeedRequestAt(), block.timestamp, "charged to the configured subscription");
+        // Re-registering the lane afterwards does not unlock a second request before the timeout.
+        vrf.setProvingKey(KEY_HASH, true);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BMCIlluminatiPass.SeedRequestPending.selector, block.timestamp + pass.SEED_REQUEST_TIMEOUT()
+            )
+        );
+        pass.requestSeed();
+        assertTrue(vrf.fulfill(moved, 3));
+        assertEq(pass.seed(), 3);
     }
 
     // ------------------------------------------------------------------ receivers and reentrancy
@@ -463,15 +623,31 @@ contract VRFEdgeCasesTest is Test {
         vm.startPrank(bob);
         vm.expectRevert(BMCIlluminatiPass.OnlyCoordinator.selector);
         pass.rawFulfillRandomWords(req, _words(1));
+        // The owner is bound by the same rules as anyone: the configured subscription is rate-limited
+        // and pinned to its lane ...
         vm.expectRevert(
             abi.encodeWithSelector(
                 BMCIlluminatiPass.SeedRequestPending.selector, pass.lastSeedRequestAt() + pass.SEED_REQUEST_TIMEOUT()
             )
         );
-        pass.requestSeedWith(1, OTHER_LANE);
+        pass.requestSeedWith(SUB_ID, KEY_HASH);
+        // (the pending-request check comes before the lane rule, so another lane is refused the same way)
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BMCIlluminatiPass.SeedRequestPending.selector, pass.lastSeedRequestAt() + pass.SEED_REQUEST_TIMEOUT()
+            )
+        );
+        pass.requestSeedWith(SUB_ID, OTHER_LANE);
+        // ... and paying from the owner's own subscription buys no choice: the word that lands first
+        // is the seed, whoever paid for the request that carried it.
+        uint256 ownersReq = pass.requestSeedWith(1, OTHER_LANE);
         vm.stopPrank();
+        assertEq(pass.seedRequestCount(), 2);
         assertTrue(vrf.fulfill(req, 1));
         assertEq(pass.seed(), 1);
+        assertTrue(vrf.fulfill(ownersReq, 2));
+        assertEq(pass.seed(), 1);
+        assertEq(pass.seedRequestId(), req);
     }
 
     // ------------------------------------------------------------------ materialization

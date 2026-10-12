@@ -7,9 +7,10 @@ import {MockBMC} from "./mocks/MockBMC.sol";
 import {MockVRFCoordinator} from "./mocks/MockVRFCoordinator.sol";
 
 /// @notice Drives the pass with random sequences: mints of both phases by several actors, time
-///         passing, seed requests on both paths, deliveries in any order with any gas, redeliveries,
-///         rogue callbacks, materialization in any batch size, transfers and owner actions. Every
-///         action asserts its own pre/post conditions; ghost variables record what the contract owes.
+///         passing, seed requests on both paths from the configured and two foreign subscriptions on
+///         three lanes, deliveries in any order with any gas, redeliveries, rogue callbacks,
+///         materialization in any batch size, transfers and owner actions. Every action asserts its own
+///         pre/post conditions; ghost variables record what the contract owes.
 contract PassHandler is Test {
     MockBMC public bmc;
     MockVRFCoordinator public vrf;
@@ -33,9 +34,15 @@ contract PassHandler is Test {
     bytes32 public ghostOutcome41;
     bytes32 public ghostOutcomeLast;
     uint256[] public requestIds;
-    uint256 public ghostLastRequestAt;
+    /// @dev Per-subscription clocks mirrored from the handler's own view of accepted requests.
+    mapping(uint256 subscriptionId => uint256) public ghostLastRequestAtOf;
+    uint256[] public subscriptionsUsed;
+    mapping(uint256 subscriptionId => bool) subscriptionSeen;
     bool public ghostRequestWhileOpen;
     bool public ghostRequestTooSoon;
+    bool public ghostConfiguredLaneLeftWhileRegistered;
+    uint256 public ghostForeignRequests;
+    uint256 public ghostConfiguredRequests;
     uint256 public ghostFinalizedTokens;
     mapping(uint256 artwork => bool) genesisArtSeen;
     mapping(uint256 artwork => bool) standardArtSeen;
@@ -156,45 +163,75 @@ contract PassHandler is Test {
 
     // ------------------------------------------------------------------ requests
 
+    /// @dev Subscriptions are drawn from a small set (the configured one and two foreign ones) so the
+    ///      same subscription is hit again inside its own timeout, and different ones inside each
+    ///      other's.
+    function _subscription(uint256 subSeed) internal view returns (uint256) {
+        uint256 s = subSeed % 3;
+        return s == 0 ? pass.SUBSCRIPTION_ID() : (s == 1 ? 777 : 999);
+    }
+
+    function _timeoutClear(uint256 subscriptionId) internal view returns (bool) {
+        uint64 lastAt = pass.lastSeedRequestAtOf(subscriptionId);
+        return lastAt == 0 || block.timestamp >= uint256(lastAt) + pass.SEED_REQUEST_TIMEOUT();
+    }
+
     function requestSeed(uint256 actorSeed, uint8 path, uint256 subSeed) external {
         callsRequest++;
         address who = actorSeed % 7 == 0 ? owner : _actor(actorSeed);
         uint256 p = path % 4;
         bytes32 lane = p == 1 ? OTHER_LANE : (p == 2 ? BOGUS_LANE : pass.KEY_HASH());
+        uint256 sub = p == 0 ? pass.SUBSCRIPTION_ID() : _subscription(subSeed);
         bool laneOk = p != 2;
+        // The configured subscription is pinned to its lane while the coordinator registers it (it
+        // always does in this harness).
+        bool pinned = sub == pass.SUBSCRIPTION_ID() && lane != pass.KEY_HASH();
         bool closed = pass.saleClosed();
-        bool allowed = closed && pass.totalMinted() > 40 && !pass.seedSet()
-            && (pass.lastSeedRequestAt() == 0
-                || block.timestamp >= pass.lastSeedRequestAt() + pass.SEED_REQUEST_TIMEOUT()) && laneOk;
+        bool allowed = closed && !pass.seedSet() && _timeoutClear(sub) && laneOk && !pinned;
         uint256 countBefore = pass.seedRequestCount();
+        uint64 configuredBefore = pass.lastSeedRequestAt();
         vm.prank(who);
         if (p == 0) {
             try pass.requestSeed() returns (uint256 id) {
-                _afterRequest(id, allowed, closed, countBefore);
+                _afterRequest(id, sub, allowed, closed, countBefore);
             } catch {
                 assertFalse(allowed, "request refused while allowed");
                 assertEq(pass.seedRequestCount(), countBefore);
             }
         } else {
-            try pass.requestSeedWith(subSeed, lane) returns (uint256 id) {
-                _afterRequest(id, allowed, closed, countBefore);
+            try pass.requestSeedWith(sub, lane) returns (uint256 id) {
+                _afterRequest(id, sub, allowed, closed, countBefore);
+                if (pinned) ghostConfiguredLaneLeftWhileRegistered = true;
+                (,,, bytes32 kh, uint256 chargedTo,,) = vrf.requests(id);
+                assertEq(kh, lane, "request on another lane than asked");
+                assertEq(chargedTo, sub, "request charged to another subscription than asked");
             } catch {
                 assertFalse(allowed, "recovery request refused while allowed");
                 assertEq(pass.seedRequestCount(), countBefore);
             }
         }
+        if (sub != pass.SUBSCRIPTION_ID()) {
+            assertEq(pass.lastSeedRequestAt(), configuredBefore, "foreign request moved the configured clock");
+        }
     }
 
-    function _afterRequest(uint256 id, bool allowed, bool closed, uint256 countBefore) internal {
+    function _afterRequest(uint256 id, uint256 sub, bool allowed, bool closed, uint256 countBefore) internal {
         assertTrue(allowed, "request accepted while not allowed");
         if (!closed) ghostRequestWhileOpen = true;
-        if (ghostLastRequestAt != 0 && block.timestamp < ghostLastRequestAt + pass.SEED_REQUEST_TIMEOUT()) {
+        uint256 lastAt = ghostLastRequestAtOf[sub];
+        if (lastAt != 0 && block.timestamp < lastAt + pass.SEED_REQUEST_TIMEOUT()) {
             ghostRequestTooSoon = true;
         }
-        ghostLastRequestAt = block.timestamp;
+        ghostLastRequestAtOf[sub] = block.timestamp;
+        if (!subscriptionSeen[sub]) {
+            subscriptionSeen[sub] = true;
+            subscriptionsUsed.push(sub);
+        }
+        if (sub == pass.SUBSCRIPTION_ID()) ghostConfiguredRequests++;
+        else ghostForeignRequests++;
         assertTrue(pass.isSeedRequest(id));
         assertEq(pass.seedRequestCount(), countBefore + 1);
-        assertEq(pass.lastSeedRequestAt(), block.timestamp);
+        assertEq(pass.lastSeedRequestAtOf(sub), block.timestamp);
         requestIds.push(id);
     }
 
@@ -330,12 +367,11 @@ contract PassHandler is Test {
             pass.renounceOwnership();
         } else {
             // The owner has no reroll: an owner-initiated second request obeys the same rules.
-            bool allowed = pass.saleClosed() && pass.totalMinted() > 40 && !pass.seedSet()
-                && (pass.lastSeedRequestAt() == 0
-                    || block.timestamp >= pass.lastSeedRequestAt() + pass.SEED_REQUEST_TIMEOUT());
+            uint256 sub = pass.SUBSCRIPTION_ID();
+            bool allowed = pass.saleClosed() && !pass.seedSet() && _timeoutClear(sub);
             uint256 countBefore = pass.seedRequestCount();
             try pass.requestSeed() returns (uint256 id) {
-                _afterRequest(id, allowed, pass.saleClosed(), countBefore);
+                _afterRequest(id, sub, allowed, pass.saleClosed(), countBefore);
             } catch {
                 assertFalse(allowed);
             }
@@ -344,6 +380,10 @@ contract PassHandler is Test {
 
     function requestCount() external view returns (uint256) {
         return requestIds.length;
+    }
+
+    function subscriptionsUsedCount() external view returns (uint256) {
+        return subscriptionsUsed.length;
     }
 }
 
@@ -436,11 +476,23 @@ contract PassInvariantsTest is Test {
     function invariant_SeedIsWriteOnceAndOnlyAfterClose() public view {
         assertEq(vrf.requestCount(), pass.seedRequestCount(), "every coordinator request is accounted");
         assertEq(handler.requestCount(), pass.seedRequestCount());
+        assertEq(pass.seedRequestCount(), handler.ghostConfiguredRequests() + handler.ghostForeignRequests());
         assertFalse(handler.ghostRequestWhileOpen(), "a request was made while the sale was open");
-        assertFalse(handler.ghostRequestTooSoon(), "requests closer than the timeout");
+        assertFalse(handler.ghostRequestTooSoon(), "one subscription requested twice inside its timeout");
+        assertFalse(handler.ghostConfiguredLaneLeftWhileRegistered(), "configured subscription moved lane");
         if (pass.seedRequestCount() > 0) {
             assertTrue(pass.saleClosed());
             assertGt(pass.totalMinted(), 40);
+        }
+        // Each subscription's clock is exactly the time of its own latest accepted request; the
+        // configured subscription's view reports that clock and nothing else.
+        for (uint256 i = 0; i < handler.subscriptionsUsedCount(); i++) {
+            uint256 sub = handler.subscriptionsUsed(i);
+            assertEq(uint256(pass.lastSeedRequestAtOf(sub)), handler.ghostLastRequestAtOf(sub), "subscription clock");
+        }
+        assertEq(uint256(pass.lastSeedRequestAt()), handler.ghostLastRequestAtOf(pass.SUBSCRIPTION_ID()));
+        if (!pass.seedSet() && pass.lastSeedRequestAt() != 0) {
+            assertEq(pass.seedRequestAvailableAt(), uint256(pass.lastSeedRequestAt()) + pass.SEED_REQUEST_TIMEOUT());
         }
         if (handler.ghostSeedEverSet()) {
             assertTrue(pass.seedSet());

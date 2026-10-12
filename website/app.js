@@ -11,7 +11,8 @@
     totalMinted: "totalMinted()", totalBurned: "totalBurned()", currentPrice: "currentPrice()",
     genesisPhaseActive: "genesisPhaseActive()", remainingSupply: "remainingSupply()", pendingReveals: "pendingReveals()",
     remainingMysteryGenesis: "remainingMysteryGenesis()", remainingMysteryStandard: "remainingMysteryStandard()",
-    genesisCIDLocked: "genesisCIDLocked()", genesisImagesCID: "genesisImagesCID()", tierOf: "tierOf(uint256)",
+    genesisImagesCID: "genesisImagesCID()", saleClosed: "saleClosed()", seedSet: "seedSet()",
+    seedRequestAvailableAt: "seedRequestAvailableAt()", requestSeed: "requestSeed()", tierOf: "tierOf(uint256)",
     revealStatusOf: "revealStatusOf(uint256)", artworkIdOf: "artworkIdOf(uint256)", ownerOf: "ownerOf(uint256)",
     mintGenesis: "mintGenesis()", mintMystery: "mintMystery()", finalizeReveals: "finalizeReveals(uint256)",
   };
@@ -74,28 +75,31 @@
   async function refresh() {
     if (!state.provider || !C.PASS_ADDRESS) return;
     const P = C.PASS_ADDRESS;
-    const [minted, burned, price, phase, pending, remG, remS, cidLocked] = await Promise.all([
+    const [minted, burned, price, phase, pending, remG, remS, closed, seeded, seedAt] = await Promise.all([
       call(P, SEL.totalMinted), call(P, SEL.totalBurned), call(P, SEL.currentPrice), call(P, SEL.genesisPhaseActive),
-      call(P, SEL.pendingReveals), call(P, SEL.remainingMysteryGenesis), call(P, SEL.remainingMysteryStandard), call(P, SEL.genesisCIDLocked),
+      call(P, SEL.pendingReveals), call(P, SEL.remainingMysteryGenesis), call(P, SEL.remainingMysteryStandard),
+      call(P, SEL.saleClosed), call(P, SEL.seedSet), call(P, SEL.seedRequestAvailableAt),
     ]).then((r) => r.map(decUint));
     const genesisPhase = phase === 1n;
-    $("phase").textContent = minted >= 500n ? "Sold out" : genesisPhase ? "Phase 1 · Genesis" : "Phase 2 · Mystery";
-    $("price").textContent = minted >= 500n ? "—" : fmt(price);
+    const saleClosed = closed === 1n;
+    $("phase").textContent = minted >= 500n ? "Sold out" : saleClosed ? "Sale closed" : genesisPhase ? "Phase 1 · Genesis" : "Phase 2 · Mystery";
+    $("price").textContent = saleClosed ? "—" : fmt(price);
     $("supply").textContent = `${minted} / 500`;
     $("burned").textContent = fmt(burned);
     $("genesis-left").textContent = genesisPhase ? `${40n - minted} Genesis mints left in phase 1.` : "Phase 1 complete.";
-    $("genesis-card").classList.toggle("disabled", !genesisPhase || cidLocked === 0n);
-    $("mystery-card").classList.toggle("disabled", genesisPhase || minted >= 500n || cidLocked === 0n);
+    $("genesis-card").classList.toggle("disabled", !genesisPhase);
+    $("mystery-card").classList.toggle("disabled", genesisPhase || saleClosed);
     const poolLeft = remG + remS;
     const sold = minted > 40n ? minted - 40n : 0n;
     const unsold = 460n - sold;
     let odds = `Remaining inventory: ${remG} Genesis and ${remS} Standard outcomes still in the pool (${poolLeft} total). ${unsold} mystery mints unsold.`;
-    if (pending > 0n) odds += ` ${pending} reveals are pending, so ${pending} of those outcomes are already owed to minted tokens: the odds below are provisional until they are drawn.`;
-    if (unsold > 0n && poolLeft > 0n) {
-      const pct = Number(remG * 10000n / poolLeft) / 100;
-      odds += ` Current Genesis chance per draw from the remaining pool: about ${pct}%.`;
-    }
-    $("odds").textContent = cidLocked === 0n ? "Minting opens once the Genesis image CID is set on-chain." : odds;
+    if (pending > 0n) odds += ` ${pending} outcomes are owed to minted tokens and not materialized yet.`;
+    odds += " Every mystery mint has the same 37-in-460 (8.04%) Genesis chance: one seed, drawn after the sale closes.";
+    if (seeded === 1n) odds += " The seed is on-chain: every outcome is final (anyone can materialize them with Finalize).";
+    else if (saleClosed) odds += seedAt > 0n && Number(seedAt) * 1000 > Date.now() ? ` Seed request opens again at ${new Date(Number(seedAt) * 1000).toUTCString()}.` : " The sale is closed: anyone can request the Chainlink VRF seed now.";
+    else if (!genesisPhase && seedAt > 0n) odds += ` Without a new mint, the sale closes and the seed can be requested from ${new Date(Number(seedAt) * 1000).toUTCString()}.`;
+    $("odds").textContent = odds;
+    $("request-seed").classList.toggle("disabled", !(saleClosed && seeded === 0n && Number(seedAt) * 1000 <= Date.now()));
     if (state.account) {
       const [bal, alw] = await Promise.all([
         call(C.BMC_ADDRESS, SEL.balanceOf, encAddr(state.account)),
@@ -115,7 +119,7 @@
         call(P, SEL.tierOf, encUint(id)), call(P, SEL.revealStatusOf, encUint(id)), call(P, SEL.artworkIdOf, encUint(id)), call(P, SEL.ownerOf, encUint(id)),
       ]);
       const tiers = ["Pending reveal", "Legendary Genesis", "Genesis", "Standard"];
-      const statuses = ["—", "Awaiting Chainlink VRF randomness", "Randomness stored, waiting for in-order finalization (anyone can call finalize)", "Revealed"];
+      const statuses = ["—", "Awaiting the Chainlink VRF seed (requested once the sale closes)", "Seed delivered: outcome final, not yet materialized on-chain (anyone can call finalize)", "Revealed"];
       const o = "0x" + owner.slice(-40);
       $("lookup-result").innerHTML = `Token #${id}: <b>${tiers[Number(decUint(tier))]}</b> · ${statuses[Number(decUint(status))]} · artwork id ${decUint(art)} · owner <a href="${C.EXPLORER}/address/${o}" target="_blank" rel="noopener">${o.slice(0, 8)}…</a>`;
     } catch (e) { $("lookup-result").textContent = "Token not found or call failed."; }
@@ -146,7 +150,8 @@
     $("mint-genesis").onclick = () => send(C.PASS_ADDRESS, SEL.mintGenesis);
     $("approve-mystery").onclick = () => send(C.BMC_ADDRESS, SEL.approve + encAddr(C.PASS_ADDRESS) + encUint(C.MYSTERY_PRICE));
     $("mint-mystery").onclick = () => send(C.PASS_ADDRESS, SEL.mintMystery);
-    $("finalize").onclick = () => send(C.PASS_ADDRESS, SEL.finalizeReveals + encUint(10));
+    $("finalize").onclick = () => send(C.PASS_ADDRESS, SEL.finalizeReveals + encUint(50));
+    $("request-seed").onclick = () => send(C.PASS_ADDRESS, SEL.requestSeed);
     $("lookup").onclick = lookup;
     gallery();
     if (window.ethereum && window.ethereum.selectedAddress) connect();

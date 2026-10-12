@@ -46,7 +46,7 @@
     </div>
     <div class="card" id="mystery-card">
       <h2>Phase 2 · Mystery mint</h2>
-      <p>Remaining 460 mints. 350,000 BMC each, permanently burned. You receive a pending-reveal NFT immediately; Chainlink VRF then decides Genesis (41–77) or Standard (on-chain SVG).</p>
+      <p>Remaining 460 mints. 350,000 BMC each, permanently burned. You receive a pending-reveal NFT immediately. One Chainlink VRF seed, requested only after the sale closes, decides every outcome at once: Genesis (41–77) or Standard (on-chain SVG), 37-in-460 odds for every mint.</p>
       <div class="row">
         <button id="approve-mystery" class="btn ghost">1. Approve 350,000 BMC</button>
         <button id="mint-mystery" class="btn">2. Mystery Mint</button>
@@ -61,7 +61,8 @@
     <div class="row">
       <input id="lookup-id" type="number" min="1" max="500" placeholder="Token id">
       <button id="lookup" class="btn ghost">Check reveal status</button>
-      <button id="finalize" class="btn ghost">Finalize stored reveals (anyone)</button>
+      <button id="request-seed" class="btn ghost">Request VRF seed (anyone, once the sale is closed)</button>
+      <button id="finalize" class="btn ghost">Materialize reveals (anyone)</button>
     </div>
     <p id="lookup-result" class="hint"></p>
   </section>
@@ -71,16 +72,16 @@
     <ul class="faq">
       <li><strong>Gas.</strong> Every approve and mint is an Ethereum transaction. You pay ETH gas on top of the BMC price. The BMC price is fixed in the contract; gas is set by the network and your wallet.</li>
       <li><strong>Burning.</strong> The contract calls BMC <code>burnFrom</code> on your exact approval. Burned BMC is destroyed, not sent anywhere. Nothing is burned when you transfer a pass later.</li>
-      <li><strong>VRF reveal delay.</strong> A mystery mint opens a Chainlink VRF v2.5 request. Chainlink answers after the configured block confirmations (usually a few minutes). Until then your NFT shows neutral pending metadata. Reveals are finalized in mint order, so a reveal can also wait for the mints just before it.</li>
-      <li><strong>No rerolls.</strong> Nobody, including the team, can reroll, pick artwork, change prices or metadata, mint for free, or withdraw anything. The only team powers are setting the Genesis image CID once and updating the VRF request settings for future requests.</li>
-      <li><strong>If randomness is late.</strong> A request stays pending until Chainlink fulfils it. If the VRF subscription runs dry, anyone can fund it and pending requests complete. There is no fallback randomness.</li>
-      <li><strong>Odds.</strong> Shown from the remaining on-chain inventory. While reveals are outstanding the odds are provisional, because pending tokens already own outcomes that have not been drawn yet.</li>
+      <li><strong>One seed, after the sale.</strong> No randomness is requested while minting is open. The sale closes when all 500 are sold or when 30 days pass without a mint after the Genesis phase; then anyone can request a single Chainlink VRF v2.5 word. The moment it lands, every mystery outcome is final and visible in the metadata.</li>
+      <li><strong>No rerolls.</strong> Nobody, including the team, can reroll, pick artwork, change prices or metadata, mint for free, or withdraw anything. The team has no configuration power at all: images CID, VRF coordinator, subscription and gas lane are fixed at deployment.</li>
+      <li><strong>If randomness is late.</strong> If a request is not answered within 36 hours (an unfunded subscription, for example), anyone can request again, even from another funded subscription. The first word delivered wins; later deliveries are ignored.</li>
+      <li><strong>Odds.</strong> Every mystery mint has the same 37-in-460 chance of Genesis, whatever its position and however many are sold. The remaining-inventory figures only track which outcomes have been materialized on-chain.</li>
     </ul>
   </section>
 
   <section class="card">
     <h2>Preview gallery</h2>
-    <p class="hint">Genesis artworks are served from IPFS once the directory CID is set. Standard passes are generated fully on-chain as SVG, 423 unique combinations of 6 backgrounds, 5 cloaks, 6 eyes, 5 symbols and 6 accessories.</p>
+    <p class="hint">Genesis artworks are served from the IPFS directory fixed in the contract. Standard passes are generated fully on-chain as SVG, 423 unique combinations of 6 backgrounds, 5 cloaks, 6 eyes, 5 symbols and 6 accessories.</p>
     <div class="gallery" id="gallery"></div>
   </section>
 </main>

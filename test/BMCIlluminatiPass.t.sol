@@ -3,9 +3,9 @@ pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {BMCIlluminatiPass} from "../src/BMCIlluminatiPass.sol";
 import {StandardArt} from "../src/StandardArt.sol";
+import {MysteryDraw} from "../src/MysteryDraw.sol";
 import {MockBMC, FakeBurnBMC, SixDecimalBMC} from "./mocks/MockBMC.sol";
 import {MockVRFCoordinator} from "./mocks/MockVRFCoordinator.sol";
 import {DeployBMCIlluminatiPass} from "../script/Deploy.s.sol";
@@ -54,16 +54,15 @@ contract BMCIlluminatiPassTest is Test {
 
     uint256 constant GENESIS_PRICE = 1_000_000e18;
     uint256 constant MYSTERY_PRICE = 350_000e18;
-    bytes32 constant KEY_HASH = keccak256("500 gwei lane");
+    uint256 constant SUB_ID = 27852459484169864437638942739291618120641810244677084392617474192083559562985;
+    bytes32 constant KEY_HASH = 0x3fd2fec10d06ee8f65e7f2e95f5c56511359ece3f33960ad8a866ae24a8ff10b;
+    string constant CID = "bafybeihfihwwpev4gkqjuqawgtptsv3ynzsokclo6odsolvoa65aqaac2u";
 
     function setUp() public {
+        vm.warp(1_760_000_000);
         bmc = new MockBMC();
         vrf = new MockVRFCoordinator();
-        pass = new BMCIlluminatiPass(owner, address(bmc), address(vrf));
-        vm.startPrank(owner);
-        pass.setGenesisImagesCID("bafybeigdyrztestcidgenesisdirectory");
-        pass.setVRFConfig(42, KEY_HASH, 300_000, 3, false);
-        vm.stopPrank();
+        pass = new BMCIlluminatiPass(owner, address(bmc), address(vrf), SUB_ID);
     }
 
     // ------------------------------------------------------------------ helpers
@@ -80,11 +79,11 @@ contract BMCIlluminatiPassTest is Test {
         vm.stopPrank();
     }
 
-    function _mintMysteryAs(address who) internal returns (uint256 id, uint256 req) {
+    function _mintMysteryAs(address who) internal returns (uint256 id) {
         _fund(who, MYSTERY_PRICE);
         vm.startPrank(who);
         bmc.approve(address(pass), MYSTERY_PRICE);
-        (id, req) = pass.mintMystery();
+        id = pass.mintMystery();
         vm.stopPrank();
     }
 
@@ -93,6 +92,17 @@ contract BMCIlluminatiPassTest is Test {
             _mintGenesisAs(address(uint160(0x1000 + i)));
         }
         assertEq(pass.totalMinted(), 40);
+    }
+
+    function _closeSaleByIdle() internal {
+        vm.warp(block.timestamp + pass.SALE_IDLE_TIMEOUT());
+        assertTrue(pass.saleClosed());
+    }
+
+    function _deliverSeed(uint256 word) internal returns (uint256 req) {
+        req = pass.requestSeed();
+        assertTrue(vrf.fulfill(req, word));
+        assertTrue(pass.seedSet());
     }
 
     function _decodeTokenURI(uint256 id) internal view returns (string memory) {
@@ -151,18 +161,38 @@ contract BMCIlluminatiPassTest is Test {
         DeployBMCIlluminatiPass.Config memory cfg = d.mainnetConfig(owner);
         assertEq(cfg.bmc, 0x38224239f2BDae357D47cb864BC533d7f72dF961);
         assertEq(cfg.vrfCoordinator, 0xD7f86b4b8Cae7D942340FF628F82735b7a20893a);
+        assertEq(cfg.subscriptionId, SUB_ID);
         BMCIlluminatiPass p = d.deploy(cfg);
         assertEq(p.owner(), owner);
         assertEq(address(p.BMC()), cfg.bmc);
         assertEq(address(p.VRF_COORDINATOR()), cfg.vrfCoordinator);
+        assertEq(p.SUBSCRIPTION_ID(), SUB_ID);
         assertEq(p.name(), "BMC Illuminati Pass");
         assertEq(p.symbol(), "BMCPASS");
-        assertFalse(p.genesisCIDLocked());
-        // Nothing can be minted on a fresh deployment until the CID is set.
-        vm.expectRevert(BMCIlluminatiPass.GenesisCIDNotSet.selector);
-        p.mintGenesis();
-        vm.expectRevert(BMCIlluminatiPass.GenesisCIDNotSet.selector);
-        p.mintMystery();
+        // Fully configured at construction: no owner call is needed before the first mint.
+        assertEq(p.genesisImagesCID(), CID);
+        assertEq(p.KEY_HASH(), KEY_HASH);
+        assertEq(p.CALLBACK_GAS_LIMIT(), 500_000);
+        assertEq(p.REQUEST_CONFIRMATIONS(), 3);
+        assertTrue(p.NATIVE_PAYMENT());
+    }
+
+    function test_ConstructorMakesNoExternalCall() public {
+        // Addresses without code: the launch rehearses constructors on an empty chain.
+        BMCIlluminatiPass p = new BMCIlluminatiPass(owner, address(0x1234), address(0x5678), 1);
+        assertEq(address(p.BMC()), address(0x1234));
+        assertEq(p.owner(), owner);
+    }
+
+    function test_ConstructorRejectsZeroArguments() public {
+        vm.expectRevert(bytes("zero argument"));
+        new BMCIlluminatiPass(owner, address(0), address(vrf), SUB_ID);
+        vm.expectRevert(bytes("zero argument"));
+        new BMCIlluminatiPass(owner, address(bmc), address(0), SUB_ID);
+        vm.expectRevert(bytes("zero argument"));
+        new BMCIlluminatiPass(owner, address(bmc), address(vrf), 0);
+        vm.expectRevert();
+        new BMCIlluminatiPass(address(0), address(bmc), address(vrf), SUB_ID);
     }
 
     function test_DeployScriptRequiresOwner() public {
@@ -183,71 +213,30 @@ contract BMCIlluminatiPassTest is Test {
         assertEq(pass.MYSTERY_PRICE(), MYSTERY_PRICE);
         assertEq(pass.MAX_TOTAL_BURN(), 201_000_000e18);
         assertEq(40 * GENESIS_PRICE + 460 * MYSTERY_PRICE, pass.MAX_TOTAL_BURN());
+        assertEq(pass.SALE_IDLE_TIMEOUT(), 30 days);
+        assertEq(pass.SEED_REQUEST_TIMEOUT(), 36 hours);
+        assertGt(pass.SEED_REQUEST_TIMEOUT(), 24 hours, "longer than Chainlink's pending window");
+        assertEq(pass.GENESIS_IMAGES_CID(), CID);
     }
 
-    function test_CIDSetOnce() public {
-        BMCIlluminatiPass p = new BMCIlluminatiPass(owner, address(bmc), address(vrf));
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        p.setGenesisImagesCID("x");
-        vm.prank(owner);
-        vm.expectRevert(BMCIlluminatiPass.EmptyCID.selector);
-        p.setGenesisImagesCID("");
-        vm.prank(owner);
-        p.setGenesisImagesCID("bafyREAL");
-        assertEq(p.genesisImagesCID(), "bafyREAL");
-        vm.prank(owner);
-        vm.expectRevert(BMCIlluminatiPass.GenesisCIDAlreadySet.selector);
-        p.setGenesisImagesCID("bafyOTHER");
-    }
-
-    function test_VRFConfigValidation() public {
+    function test_NoOwnerConfigurationSurface() public {
+        // The owner has no on-chain power: these selectors from the previous design no longer exist.
+        (bool ok,) = address(pass).call(abi.encodeWithSignature("setGenesisImagesCID(string)", "x"));
+        assertFalse(ok);
+        (ok,) = address(pass)
+            .call(
+                abi.encodeWithSignature(
+                    "setVRFConfig(uint256,bytes32,uint32,uint16,bool)", 1, KEY_HASH, 500_000, 3, true
+                )
+            );
+        assertFalse(ok);
+        (ok,) = address(pass).call(abi.encodeWithSignature("setCoordinator(address)", address(1)));
+        assertFalse(ok);
         vm.startPrank(owner);
-        vm.expectRevert(BMCIlluminatiPass.InvalidVRFConfig.selector);
-        pass.setVRFConfig(0, KEY_HASH, 300_000, 3, false);
-        vm.expectRevert(BMCIlluminatiPass.InvalidVRFConfig.selector);
-        pass.setVRFConfig(1, bytes32(0), 300_000, 3, false);
-        vm.expectRevert(BMCIlluminatiPass.InvalidVRFConfig.selector);
-        pass.setVRFConfig(1, KEY_HASH, 100_000, 3, false);
-        vm.expectRevert(BMCIlluminatiPass.InvalidVRFConfig.selector);
-        pass.setVRFConfig(1, KEY_HASH, 3_000_000, 3, false);
-        vm.expectRevert(BMCIlluminatiPass.InvalidVRFConfig.selector);
-        pass.setVRFConfig(1, KEY_HASH, 300_000, 2, false);
-        vm.expectRevert(BMCIlluminatiPass.InvalidVRFConfig.selector);
-        pass.setVRFConfig(1, KEY_HASH, 300_000, 201, false);
-        pass.setVRFConfig(7, KEY_HASH, 250_000, 5, true);
+        vm.expectRevert();
+        pass.mintGenesis(); // no allowance / balance: owner pays like anyone else
         vm.stopPrank();
-        (uint256 sub, bytes32 kh, uint32 cb, uint16 conf, bool native, bool configured) = pass.vrfConfig();
-        assertEq(sub, 7);
-        assertEq(kh, KEY_HASH);
-        assertEq(cb, 250_000);
-        assertEq(conf, 5);
-        assertTrue(native);
-        assertTrue(configured);
-        vm.prank(alice);
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        pass.setVRFConfig(7, KEY_HASH, 250_000, 5, true);
-    }
-
-    function test_MysteryRevertsWhenVRFUnconfigured() public {
-        BMCIlluminatiPass p = new BMCIlluminatiPass(owner, address(bmc), address(vrf));
-        vm.prank(owner);
-        p.setGenesisImagesCID("cid");
-        for (uint256 i = 0; i < 40; i++) {
-            address who = address(uint160(0x2000 + i));
-            _fund(who, GENESIS_PRICE);
-            vm.startPrank(who);
-            bmc.approve(address(p), GENESIS_PRICE);
-            p.mintGenesis();
-            vm.stopPrank();
-        }
-        _fund(alice, MYSTERY_PRICE);
-        vm.startPrank(alice);
-        bmc.approve(address(p), MYSTERY_PRICE);
-        vm.expectRevert(BMCIlluminatiPass.VRFNotConfigured.selector);
-        p.mintMystery();
-        vm.stopPrank();
-        assertEq(bmc.balanceOf(alice), MYSTERY_PRICE, "no burn when request impossible");
+        assertEq(pass.totalMinted(), 0);
     }
 
     // ------------------------------------------------------------------ phase 1
@@ -258,9 +247,10 @@ contract BMCIlluminatiPassTest is Test {
         assertEq(pass.ownerOf(1), alice);
         assertEq(uint8(pass.tierOf(1)), uint8(BMCIlluminatiPass.Tier.LegendaryGenesis));
         assertEq(pass.artworkIdOf(1), 1);
+        assertEq(uint8(pass.revealStatusOf(1)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
         string memory json = _decodeTokenURI(1);
         assertTrue(_contains(json, '"Legendary Genesis"'));
-        assertTrue(_contains(json, "ipfs://bafybeigdyrztestcidgenesisdirectory/genesis-01.png"));
+        assertTrue(_contains(json, string.concat("ipfs://", CID, "/genesis-01.png")));
         assertTrue(_contains(json, "Legendary Golden Crown"));
     }
 
@@ -320,6 +310,15 @@ contract BMCIlluminatiPassTest is Test {
         vm.stopPrank();
     }
 
+    function test_GenesisPhaseNeverClosesByIdleTime() public {
+        _mintGenesisAs(alice);
+        vm.warp(block.timestamp + 400 days);
+        assertFalse(pass.saleClosed());
+        assertEq(pass.seedRequestAvailableAt(), 0);
+        uint256 id = _mintGenesisAs(bob);
+        assertEq(id, 2);
+    }
+
     // ------------------------------------------------------------------ burn / allowance failures
 
     function test_RevertNoAllowance() public {
@@ -364,9 +363,7 @@ contract BMCIlluminatiPassTest is Test {
 
     function test_RevertWhenTokenDoesNotActuallyBurn() public {
         FakeBurnBMC fake = new FakeBurnBMC();
-        BMCIlluminatiPass p = new BMCIlluminatiPass(owner, address(fake), address(vrf));
-        vm.prank(owner);
-        p.setGenesisImagesCID("cid");
+        BMCIlluminatiPass p = new BMCIlluminatiPass(owner, address(fake), address(vrf), SUB_ID);
         fake.mint(alice, GENESIS_PRICE);
         vm.startPrank(alice);
         fake.approve(address(p), GENESIS_PRICE);
@@ -377,28 +374,13 @@ contract BMCIlluminatiPassTest is Test {
 
     function test_RevertWhenTokenDecimalsUnexpected() public {
         SixDecimalBMC six = new SixDecimalBMC();
-        BMCIlluminatiPass p = new BMCIlluminatiPass(owner, address(six), address(vrf));
-        vm.prank(owner);
-        p.setGenesisImagesCID("cid");
+        BMCIlluminatiPass p = new BMCIlluminatiPass(owner, address(six), address(vrf), SUB_ID);
         six.mint(alice, GENESIS_PRICE);
         vm.startPrank(alice);
         six.approve(address(p), GENESIS_PRICE);
         vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.UnexpectedTokenDecimals.selector, uint8(6)));
         p.mintGenesis();
         vm.stopPrank();
-    }
-
-    function test_MysteryBurnRevertsIfVRFRequestFails() public {
-        _finishPhase1();
-        vrf.setRejectRequests(true);
-        _fund(alice, MYSTERY_PRICE);
-        vm.startPrank(alice);
-        bmc.approve(address(pass), MYSTERY_PRICE);
-        vm.expectRevert(bytes("mock: subscription not funded"));
-        pass.mintMystery();
-        vm.stopPrank();
-        assertEq(bmc.balanceOf(alice), MYSTERY_PRICE, "burn rolled back with the failed request");
-        assertEq(pass.totalMinted(), 40);
     }
 
     // ------------------------------------------------------------------ reentrancy
@@ -429,77 +411,202 @@ contract BMCIlluminatiPassTest is Test {
         pass.mintMystery();
         assertEq(pass.totalMinted(), 40);
         assertEq(bmc.balanceOf(address(r)), 2 * MYSTERY_PRICE);
-        // The receiver only reverts with "reentered" when its inner mint call failed; a successful
-        // reentrant mint would have let the outer mint succeed and the expectRevert above fail.
         assertEq(r.attempts(), 0, "outer revert rolled back the receiver state too");
     }
 
     // ------------------------------------------------------------------ phase 2
 
-    function test_Phase2CostsExactly350k() public {
+    function test_Phase2CostsExactly350kAndMakesNoVRFRequest() public {
         _finishPhase1();
         _fund(alice, 1_000_000e18);
         uint256 supplyBefore = bmc.totalSupply();
         vm.startPrank(alice);
         bmc.approve(address(pass), MYSTERY_PRICE);
-        (uint256 id, uint256 req) = pass.mintMystery();
+        uint256 id = pass.mintMystery();
         vm.stopPrank();
         assertEq(id, 41);
         assertEq(pass.ownerOf(41), alice);
         assertEq(bmc.balanceOf(alice), 650_000e18);
         assertEq(bmc.totalSupply(), supplyBefore - MYSTERY_PRICE);
         assertEq(pass.totalBurned(), 40 * GENESIS_PRICE + MYSTERY_PRICE);
-        assertEq(pass.requestIdOf(41), req);
-        assertEq(pass.tokenIdOfRequest(req), 41);
         assertEq(uint8(pass.tierOf(41)), uint8(BMCIlluminatiPass.Tier.Pending));
         assertEq(uint8(pass.revealStatusOf(41)), uint8(BMCIlluminatiPass.RevealStatus.AwaitingRandomness));
         assertEq(pass.pendingReveals(), 1);
         assertEq(pass.remainingMysteryMints(), 459);
         assertEq(pass.currentPrice(), MYSTERY_PRICE);
-        (,,, bytes32 kh, uint256 sub,,) = vrf.requests(req);
-        assertEq(kh, KEY_HASH);
-        assertEq(sub, 42);
+        assertEq(vrf.requestCount(), 0, "a mint never opens a VRF request");
+        // A mint's success does not depend on the coordinator at all.
+        vrf.setRejectRequests(true);
+        assertEq(_mintMysteryAs(bob), 42);
     }
 
     function test_PendingMetadataIsNeutral() public {
         _finishPhase1();
-        (uint256 id,) = _mintMysteryAs(alice);
+        uint256 id = _mintMysteryAs(alice);
         string memory json = _decodeTokenURI(id);
         assertTrue(_contains(json, "Pending Reveal"));
         assertFalse(_contains(json, "genesis-"));
         assertFalse(_contains(json, '"Standard"'));
         assertFalse(_contains(json, '"Genesis"'));
         assertEq(pass.artworkIdOf(id), 0);
+        vm.expectRevert(bytes("not standard"));
+        pass.standardSVG(id);
     }
 
-    function test_FulfillRevealsAndLocksMetadata() public {
+    function test_PendingTokenIsTransferable() public {
         _finishPhase1();
-        (uint256 id, uint256 req) = _mintMysteryAs(alice);
-        assertTrue(vrf.fulfill(req, 123456789));
-        assertEq(uint8(pass.revealStatusOf(id)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
-        BMCIlluminatiPass.Tier t = pass.tierOf(id);
-        assertTrue(t == BMCIlluminatiPass.Tier.Genesis || t == BMCIlluminatiPass.Tier.Standard);
-        uint16 art = pass.artworkIdOf(id);
-        string memory json = _decodeTokenURI(id);
-        if (t == BMCIlluminatiPass.Tier.Genesis) {
-            assertTrue(art >= 41 && art <= 77);
-            assertTrue(_contains(json, '"Genesis"'));
-        } else {
-            assertTrue(art >= 1 && art <= 423);
-            assertTrue(_contains(json, '"Standard"'));
-            assertTrue(_contains(json, "data:image/svg+xml;base64,"));
+        uint256 id = _mintMysteryAs(alice);
+        vm.prank(alice);
+        pass.transferFrom(alice, bob, id);
+        assertEq(pass.ownerOf(id), bob);
+    }
+
+    // ------------------------------------------------------------------ sale close rules
+
+    function test_SaleClosesWhenSoldOut() public {
+        _finishPhase1();
+        for (uint256 i = 0; i < 460; i++) {
+            _mintMysteryAs(address(uint160(0x5000 + (i % 97))));
         }
-        // Re-delivery of the same request changes nothing (no reroll).
-        assertTrue(vrf.redeliver(req, 987654321));
-        assertEq(uint8(pass.tierOf(id)), uint8(t));
-        assertEq(pass.artworkIdOf(id), art);
-        assertEq(keccak256(bytes(_decodeTokenURI(id))), keccak256(bytes(json)));
-        assertEq(pass.revealedCount(), 1);
+        assertTrue(pass.saleClosed());
+        assertEq(pass.seedRequestAvailableAt(), block.timestamp);
+        assertEq(pass.currentPrice(), 0);
+        assertEq(pass.remainingMysteryMints(), 0);
+        _fund(alice, GENESIS_PRICE);
+        vm.startPrank(alice);
+        bmc.approve(address(pass), GENESIS_PRICE);
+        vm.expectRevert(BMCIlluminatiPass.SoldOut.selector);
+        pass.mintMystery();
+        vm.expectRevert(BMCIlluminatiPass.GenesisPhaseOver.selector);
+        pass.mintGenesis();
+        vm.stopPrank();
+    }
+
+    function test_SaleClosesAfterIdleTimeoutAndEveryMintResetsIt() public {
+        _finishPhase1();
+        uint256 t0 = block.timestamp;
+        assertEq(pass.lastMintAt(), t0);
+        assertEq(pass.seedRequestAvailableAt(), t0 + 30 days);
+        vm.warp(t0 + 30 days - 1);
+        assertFalse(pass.saleClosed());
+        _mintMysteryAs(alice); // resets the idle clock
+        uint256 t1 = block.timestamp;
+        vm.warp(t0 + 30 days);
+        assertFalse(pass.saleClosed(), "mint one second before the deadline keeps the sale open");
+        vm.warp(t1 + 30 days);
+        assertTrue(pass.saleClosed());
+        assertEq(pass.currentPrice(), 0);
+        assertEq(pass.remainingMysteryMints(), 0);
+        _fund(bob, MYSTERY_PRICE);
+        vm.startPrank(bob);
+        bmc.approve(address(pass), MYSTERY_PRICE);
+        vm.expectRevert(BMCIlluminatiPass.SaleIsClosed.selector);
+        pass.mintMystery();
+        vm.stopPrank();
+        assertEq(bmc.balanceOf(bob), MYSTERY_PRICE, "nothing burned after close");
+        assertEq(pass.totalMinted(), 41);
+    }
+
+    function test_SeedRequestRevertsWhileSaleOpen() public {
+        _finishPhase1();
+        _mintMysteryAs(alice);
+        vm.expectRevert(BMCIlluminatiPass.SaleNotClosed.selector);
+        pass.requestSeed();
+        vm.expectRevert(BMCIlluminatiPass.SaleNotClosed.selector);
+        pass.requestSeedWith(SUB_ID, KEY_HASH);
+        assertEq(vrf.requestCount(), 0);
+    }
+
+    function test_SeedRequestRevertsWithoutMysteryTokens() public {
+        _finishPhase1();
+        _closeSaleByIdle();
+        vm.expectRevert(BMCIlluminatiPass.NothingToReveal.selector);
+        pass.requestSeed();
+        assertEq(pass.finalizeReveals(10), 0);
+    }
+
+    // ------------------------------------------------------------------ seed and reveal
+
+    function test_SeedRequestUsesConfiguredParameters() public {
+        _finishPhase1();
+        _mintMysteryAs(alice);
+        _closeSaleByIdle();
+        vm.prank(bob); // permissionless
+        uint256 req = pass.requestSeed();
+        (address consumer, uint32 gas,, bytes32 kh, uint256 sub, uint16 conf, bool native) = vrf.requests(req);
+        assertEq(consumer, address(pass));
+        assertEq(gas, 500_000);
+        assertEq(kh, KEY_HASH);
+        assertEq(sub, SUB_ID);
+        assertEq(conf, 3);
+        assertTrue(native);
+        assertTrue(pass.isSeedRequest(req));
+        assertEq(pass.seedRequestCount(), 1);
+        assertEq(pass.lastSeedRequestAt(), block.timestamp);
+        assertFalse(pass.seedSet());
+    }
+
+    function test_SeedDeliveryFinalizesMetadataInTheSameTransaction() public {
+        _finishPhase1();
+        uint256 a = _mintMysteryAs(alice);
+        uint256 b = _mintMysteryAs(bob);
+        _closeSaleByIdle();
+        uint256 req = _deliverSeed(123456789);
+        assertEq(pass.seed(), 123456789);
+        assertEq(pass.seedRequestId(), req);
+        // Outcomes are final and visible with no materialization step and no public-but-pending window.
+        for (uint256 id = a; id <= b; id++) {
+            assertEq(uint8(pass.revealStatusOf(id)), uint8(BMCIlluminatiPass.RevealStatus.RandomnessStored));
+            BMCIlluminatiPass.Tier t = pass.tierOf(id);
+            assertTrue(t == BMCIlluminatiPass.Tier.Genesis || t == BMCIlluminatiPass.Tier.Standard);
+            uint16 art = pass.artworkIdOf(id);
+            string memory json = _decodeTokenURI(id);
+            assertFalse(_contains(json, "Pending"));
+            if (t == BMCIlluminatiPass.Tier.Genesis) {
+                assertTrue(art >= 41 && art <= 77);
+                assertTrue(_contains(json, string.concat("/genesis-", vm.toString(uint256(art)), ".png")));
+            } else {
+                assertTrue(art >= 1 && art <= 423);
+                assertTrue(_contains(json, '"Standard"'));
+                assertTrue(_contains(json, "data:image/svg+xml;base64,"));
+                assertTrue(_contains(pass.standardSVG(id), "</svg>"));
+            }
+        }
+        // Materialization changes nothing visible, only the status and the counters.
+        bytes32 before = keccak256(abi.encode(_decodeTokenURI(a), _decodeTokenURI(b), pass.tierOf(a), pass.tierOf(b)));
+        assertEq(pass.finalizeReveals(10), 2);
+        assertEq(before, keccak256(abi.encode(_decodeTokenURI(a), _decodeTokenURI(b), pass.tierOf(a), pass.tierOf(b))));
+        assertEq(uint8(pass.revealStatusOf(a)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
+        assertEq(pass.revealedCount(), 2);
+        assertEq(pass.pendingReveals(), 0);
+        assertEq(pass.finalizeReveals(10), 0, "nothing left");
+    }
+
+    function test_RedeliveryAndSecondRequestCannotReroll() public {
+        _finishPhase1();
+        uint256 a = _mintMysteryAs(alice);
+        _closeSaleByIdle();
+        uint256 req = _deliverSeed(1);
+        bytes32 h = keccak256(abi.encode(pass.tierOf(a), pass.artworkIdOf(a), _decodeTokenURI(a)));
+        // Re-delivery of the same request is ignored.
+        vm.expectEmit(true, false, false, true);
+        emit BMCIlluminatiPass.SeedDeliveryIgnored(req, 2);
+        assertTrue(vrf.redeliver(req, 2));
+        assertEq(pass.seed(), 1);
+        // No new request is possible once the seed is set.
+        vm.warp(block.timestamp + 365 days);
+        vm.expectRevert(BMCIlluminatiPass.SeedAlreadyDelivered.selector);
+        pass.requestSeed();
+        vm.expectRevert(BMCIlluminatiPass.SeedAlreadyDelivered.selector);
+        pass.requestSeedWith(SUB_ID, KEY_HASH);
+        assertEq(h, keccak256(abi.encode(pass.tierOf(a), pass.artworkIdOf(a), _decodeTokenURI(a))));
     }
 
     function test_OnlyCoordinatorCanFulfill() public {
         _finishPhase1();
-        (, uint256 req) = _mintMysteryAs(alice);
+        _mintMysteryAs(alice);
+        _closeSaleByIdle();
+        uint256 req = pass.requestSeed();
         uint256[] memory words = new uint256[](1);
         words[0] = 1;
         vm.prank(alice);
@@ -514,110 +621,35 @@ contract BMCIlluminatiPassTest is Test {
         vm.prank(address(vrf));
         vm.expectRevert(BMCIlluminatiPass.NoRandomWords.selector);
         pass.rawFulfillRandomWords(req, new uint256[](0));
+        assertFalse(pass.seedSet());
     }
 
-    function test_OutOfOrderFulfillmentFinalizesInMintOrder() public {
+    function test_CallbackGasIsFarBelowLimit() public {
         _finishPhase1();
-        (uint256 a, uint256 ra) = _mintMysteryAs(alice); // 41
-        (uint256 b, uint256 rb) = _mintMysteryAs(bob); // 42
-        (uint256 c, uint256 rc) = _mintMysteryAs(alice); // 43
-        assertEq(a, 41);
-        assertEq(b, 42);
-        assertEq(c, 43);
+        _mintMysteryAs(alice);
+        _closeSaleByIdle();
+        uint256 req = pass.requestSeed();
+        // A callback that only stores the seed fits in a fraction of the 500,000 gas limit.
+        assertTrue(vrf.fulfillWithGas(req, 77, 100_000));
+        assertTrue(pass.seedSet());
+    }
 
-        // 43 arrives first: stored, cannot be finalized ahead of 41 and 42.
-        assertTrue(vrf.fulfill(rc, 777));
-        assertEq(uint8(pass.revealStatusOf(c)), uint8(BMCIlluminatiPass.RevealStatus.RandomnessStored));
-        assertEq(uint8(pass.tierOf(c)), uint8(BMCIlluminatiPass.Tier.Pending));
+    function test_FinalizeBeforeSeedDoesNothing() public {
+        _finishPhase1();
+        _mintMysteryAs(alice);
         assertEq(pass.finalizeReveals(10), 0);
         assertEq(pass.revealedCount(), 0);
-
-        // 41 arrives: 41 reveals, 42 still waiting, 43 blocked behind 42.
-        assertTrue(vrf.fulfill(ra, 888));
-        assertEq(uint8(pass.revealStatusOf(a)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
-        assertEq(uint8(pass.revealStatusOf(b)), uint8(BMCIlluminatiPass.RevealStatus.AwaitingRandomness));
-        assertEq(uint8(pass.revealStatusOf(c)), uint8(BMCIlluminatiPass.RevealStatus.RandomnessStored));
-        assertEq(pass.revealedCount(), 1);
-        assertEq(pass.pendingReveals(), 2);
-
-        // 42 arrives: callback batch reveals 42 and the already-stored 43.
-        assertTrue(vrf.fulfill(rb, 999));
-        assertEq(uint8(pass.revealStatusOf(b)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
-        assertEq(uint8(pass.revealStatusOf(c)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
-        assertEq(pass.revealedCount(), 3);
-        assertEq(pass.pendingReveals(), 0);
     }
 
-    function test_CallbackBatchIsGasAware() public {
-        // With a 300k callback and three stored words, the callback reveals what fits (2) and leaves
-        // the rest for permissionless finalization instead of failing the whole callback.
-        _finishPhase1();
-        (uint256 a, uint256 ra) = _mintMysteryAs(alice);
-        (uint256 b, uint256 rb) = _mintMysteryAs(bob);
-        (uint256 c, uint256 rc) = _mintMysteryAs(alice);
-        assertTrue(vrf.fulfill(rc, 1));
-        assertTrue(vrf.fulfill(rb, 2));
-        assertTrue(vrf.fulfill(ra, 3));
-        assertEq(uint8(pass.revealStatusOf(a)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
-        assertEq(uint8(pass.revealStatusOf(b)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
-        assertEq(uint8(pass.revealStatusOf(c)), uint8(BMCIlluminatiPass.RevealStatus.RandomnessStored));
-        assertEq(pass.finalizeReveals(10), 1);
-        assertEq(uint8(pass.revealStatusOf(c)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
-    }
-
-    function test_PermissionlessFinalizationWhenCallbackGasTooLow() public {
-        _finishPhase1();
-        (uint256 id, uint256 req) = _mintMysteryAs(alice);
-        // Enough gas to store the word, not enough to finalize inline.
-        assertTrue(vrf.fulfillWithGas(req, 4242, 95_000));
-        assertEq(uint8(pass.revealStatusOf(id)), uint8(BMCIlluminatiPass.RevealStatus.RandomnessStored));
-        assertEq(uint8(pass.tierOf(id)), uint8(BMCIlluminatiPass.Tier.Pending));
-        // Anyone finalizes; the stored word is the only randomness ever used.
-        vm.prank(bob);
-        assertEq(pass.finalizeReveals(1), 1);
-        assertEq(uint8(pass.revealStatusOf(id)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
-        assertTrue(pass.tierOf(id) != BMCIlluminatiPass.Tier.Pending);
-        assertEq(pass.finalizeReveals(5), 0, "nothing left");
-    }
-
-    function test_FinalizationOrderCannotBeChosen() public {
-        // Two tokens with stored randomness: whoever calls finalize, the result is the same.
-        _finishPhase1();
-        (uint256 a, uint256 ra) = _mintMysteryAs(alice);
-        (uint256 b, uint256 rb) = _mintMysteryAs(bob);
-        uint256 snap = vm.snapshotState();
-        assertTrue(vrf.fulfillWithGas(ra, 11, 95_000));
-        assertTrue(vrf.fulfillWithGas(rb, 22, 95_000));
-        vm.prank(bob);
-        pass.finalizeReveals(2);
-        bytes32 h1 = keccak256(abi.encode(pass.tierOf(a), pass.artworkIdOf(a), pass.tierOf(b), pass.artworkIdOf(b)));
-        vm.revertToState(snap);
-        assertTrue(vrf.fulfillWithGas(rb, 22, 95_000));
-        assertTrue(vrf.fulfillWithGas(ra, 11, 95_000));
-        vm.prank(alice);
-        pass.finalizeReveals(1);
-        vm.prank(alice);
-        pass.finalizeReveals(1);
-        bytes32 h2 = keccak256(abi.encode(pass.tierOf(a), pass.artworkIdOf(a), pass.tierOf(b), pass.artworkIdOf(b)));
-        assertEq(h1, h2);
-    }
-
-    function test_UnavailableRandomnessStaysPendingNoFallback() public {
-        _finishPhase1();
-        (uint256 id,) = _mintMysteryAs(alice);
-        vm.warp(block.timestamp + 365 days);
-        vm.roll(block.number + 2_000_000);
-        assertEq(pass.finalizeReveals(10), 0);
-        assertEq(uint8(pass.tierOf(id)), uint8(BMCIlluminatiPass.Tier.Pending));
-        // Owner changing the VRF config does not touch the pending token.
-        vm.prank(owner);
-        pass.setVRFConfig(99, keccak256("other"), 400_000, 3, true);
-        assertEq(uint8(pass.revealStatusOf(id)), uint8(BMCIlluminatiPass.RevealStatus.AwaitingRandomness));
-        assertEq(pass.finalizeReveals(10), 0);
-        // Pending token is still a normal, transferable ERC-721.
-        vm.prank(alice);
-        pass.transferFrom(alice, bob, id);
-        assertEq(pass.ownerOf(id), bob);
+    function test_ViewsRevertForNonexistent() public {
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.NonexistentToken.selector, 0));
+        pass.tierOf(0);
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.NonexistentToken.selector, 1));
+        pass.tokenURI(1);
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.NonexistentToken.selector, 501));
+        pass.artworkIdOf(501);
+        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.NonexistentToken.selector, 1));
+        pass.revealStatusOf(1);
     }
 
     function test_TransfersAreStandard() public {
@@ -632,54 +664,38 @@ contract BMCIlluminatiPassTest is Test {
         assertEq(pass.ownerOf(1), alice);
     }
 
-    function test_ViewsRevertForNonexistent() public {
-        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.NonexistentToken.selector, 0));
-        pass.tierOf(0);
-        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.NonexistentToken.selector, 1));
-        pass.tokenURI(1);
-        vm.expectRevert(abi.encodeWithSelector(BMCIlluminatiPass.NonexistentToken.selector, 501));
-        pass.artworkIdOf(501);
-    }
-
     // ------------------------------------------------------------------ full mint-out
 
     function test_Full500MintSimulation() public {
         _finishPhase1();
-        uint256[] memory reqs = new uint256[](460);
         for (uint256 i = 0; i < 460; i++) {
             address who = address(uint160(0x5000 + (i % 97)));
-            (uint256 id, uint256 req) = _mintMysteryAs(who);
+            uint256 id = _mintMysteryAs(who);
             assertEq(id, 41 + i);
             assertEq(uint8(pass.tierOf(id)), uint8(BMCIlluminatiPass.Tier.Pending));
-            reqs[i] = req;
         }
         assertEq(pass.totalMinted(), 500);
         assertEq(pass.remainingSupply(), 0);
         assertEq(pass.pendingReveals(), 460);
         assertEq(pass.currentPrice(), 0);
+        assertTrue(pass.saleClosed());
+        assertEq(vrf.requestCount(), 0);
 
-        // Sold out: no further mints of either kind.
-        _fund(alice, GENESIS_PRICE);
-        vm.startPrank(alice);
-        bmc.approve(address(pass), GENESIS_PRICE);
-        vm.expectRevert(BMCIlluminatiPass.SoldOut.selector);
-        pass.mintMystery();
-        vm.expectRevert(BMCIlluminatiPass.GenesisPhaseOver.selector);
-        pass.mintGenesis();
-        vm.stopPrank();
+        // One request, one word, every outcome final.
+        _deliverSeed(uint256(keccak256("the one seed")));
+        assertEq(vrf.requestCount(), 1);
 
-        // Fulfil in a shuffled order so stored randomness piles up out of order.
-        uint256 seed = uint256(keccak256("shuffle"));
-        for (uint256 i = 459; i > 0; i--) {
-            seed = uint256(keccak256(abi.encode(seed, i)));
-            uint256 j = seed % (i + 1);
-            (reqs[i], reqs[j]) = (reqs[j], reqs[i]);
+        // Views agree before and after materialization, in any batch size.
+        BMCIlluminatiPass.Tier[501] memory tierBefore;
+        uint16[501] memory artBefore;
+        for (uint256 id = 41; id <= 500; id++) {
+            tierBefore[id] = pass.tierOf(id);
+            artBefore[id] = pass.artworkIdOf(id);
         }
-        for (uint256 i = 0; i < 460; i++) {
-            assertTrue(vrf.fulfill(reqs[i], uint256(keccak256(abi.encode("vrf", reqs[i])))));
+        uint256 batch = 1;
+        while (pass.finalizeReveals(batch) != 0) {
+            batch = batch * 3 + 1;
         }
-        // Drain whatever the bounded callback batches left behind.
-        while (pass.finalizeReveals(50) != 0) {}
         assertEq(pass.revealedCount(), 460);
         assertEq(pass.pendingReveals(), 0);
         assertEq(pass.remainingMysteryGenesis(), 0);
@@ -693,6 +709,11 @@ contract BMCIlluminatiPassTest is Test {
         for (uint256 id = 1; id <= 500; id++) {
             BMCIlluminatiPass.Tier t = pass.tierOf(id);
             uint16 art = pass.artworkIdOf(id);
+            if (id > 40) {
+                assertEq(uint8(t), uint8(tierBefore[id]), "tier changed by materialization");
+                assertEq(art, artBefore[id], "artwork changed by materialization");
+                assertEq(uint8(pass.revealStatusOf(id)), uint8(BMCIlluminatiPass.RevealStatus.Revealed));
+            }
             if (t == BMCIlluminatiPass.Tier.LegendaryGenesis) {
                 assertEq(id, 1);
                 assertEq(art, 1);
@@ -726,20 +747,26 @@ contract BMCIlluminatiPassTest is Test {
         assertEq(pass.mysteryGenesisRevealed(), 37);
         assertEq(pass.totalBurned(), 201_000_000e18);
         assertEq(pass.totalBurned(), pass.MAX_TOTAL_BURN());
-        // Only the unspent sold-out probe balance remains: every BMC paid for a mint was destroyed.
-        assertEq(bmc.totalSupply(), GENESIS_PRICE, "every BMC paid was destroyed");
+        assertEq(bmc.totalSupply(), 0, "every BMC paid was destroyed");
     }
 
-    function test_FullMintOutWithInOrderFulfillment() public {
+    function test_PartialSaleStillDrawsFromTheFullPool() public {
+        // 100 mystery tokens sold, sale closes by idle time: each token is step i of the same draw.
         _finishPhase1();
-        for (uint256 i = 0; i < 460; i++) {
-            (, uint256 req) = _mintMysteryAs(alice);
-            assertTrue(vrf.fulfill(req, uint256(keccak256(abi.encode("w", i)))));
+        for (uint256 i = 0; i < 100; i++) {
+            _mintMysteryAs(alice);
         }
-        assertEq(pass.revealedCount(), 460);
-        assertEq(pass.mysteryGenesisRevealed(), 37);
-        assertEq(pass.remainingMysteryStandard(), 0);
-        assertEq(pass.totalBurned(), 201_000_000e18);
+        _closeSaleByIdle();
+        uint256 s = uint256(keccak256("partial"));
+        _deliverSeed(s);
+        for (uint256 i = 0; i < 100; i++) {
+            (bool genesis, uint16 art) = MysteryDraw.decode(MysteryDraw.slotAt(s, i));
+            assertEq(pass.artworkIdOf(41 + i), art);
+            assertEq(pass.tierOf(41 + i) == BMCIlluminatiPass.Tier.Genesis, genesis);
+        }
+        assertEq(pass.finalizeReveals(500), 100);
+        assertEq(pass.revealedCount(), 100);
+        assertEq(pass.remainingMysteryGenesis() + pass.remainingMysteryStandard(), 360);
     }
 
     // ------------------------------------------------------------------ standard art
@@ -797,10 +824,13 @@ contract BMCIlluminatiPassTest is Test {
 
     function test_StandardMetadataAfterReveal() public {
         _finishPhase1();
-        // Fulfil until we hit a Standard outcome (37/460 are Genesis, so this is quick).
         for (uint256 i = 0; i < 20; i++) {
-            (uint256 id, uint256 req) = _mintMysteryAs(alice);
-            vrf.fulfill(req, uint256(keccak256(abi.encode("s", i))));
+            _mintMysteryAs(alice);
+        }
+        _closeSaleByIdle();
+        _deliverSeed(uint256(keccak256("standard")));
+        // 37/460 are Genesis, so 20 tokens contain a Standard one with overwhelming probability.
+        for (uint256 id = 41; id <= 60; id++) {
             if (pass.tierOf(id) == BMCIlluminatiPass.Tier.Standard) {
                 string memory json = _decodeTokenURI(id);
                 uint16 art = pass.artworkIdOf(id);
@@ -817,23 +847,16 @@ contract BMCIlluminatiPassTest is Test {
         revert("no standard outcome in 20 draws (astronomically unlikely)");
     }
 
-    function test_NoOwnerMintOrWithdrawSurface() public {
-        // The owner has exactly two configuration powers and no mint/withdraw/price path.
-        vm.startPrank(owner);
-        vm.expectRevert(BMCIlluminatiPass.GenesisCIDAlreadySet.selector);
-        pass.setGenesisImagesCID("again");
-        vm.expectRevert();
-        pass.mintGenesis(); // no allowance / balance: owner pays like anyone else
-        vm.stopPrank();
-        assertEq(pass.totalMinted(), 0);
-    }
-
     function testFuzz_SingleRevealAlwaysInInventory(uint256 word) public {
         _finishPhase1();
-        (uint256 id, uint256 req) = _mintMysteryAs(alice);
-        assertTrue(vrf.fulfill(req, word));
+        uint256 id = _mintMysteryAs(alice);
+        _closeSaleByIdle();
+        _deliverSeed(word);
         BMCIlluminatiPass.Tier t = pass.tierOf(id);
         uint16 art = pass.artworkIdOf(id);
+        assertEq(pass.finalizeReveals(1), 1);
+        assertEq(uint8(pass.tierOf(id)), uint8(t));
+        assertEq(pass.artworkIdOf(id), art);
         if (t == BMCIlluminatiPass.Tier.Genesis) {
             assertTrue(art >= 41 && art <= 77);
             assertEq(pass.remainingMysteryGenesis(), 36);

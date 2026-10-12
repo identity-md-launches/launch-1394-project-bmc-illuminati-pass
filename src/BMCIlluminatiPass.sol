@@ -10,6 +10,7 @@ import {IVRFCoordinatorV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/inter
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 import {IBMCToken} from "./interfaces/IBMCToken.sol";
 import {StandardArt} from "./StandardArt.sol";
+import {MysteryDraw} from "./MysteryDraw.sol";
 
 /// @title BMC Illuminati Pass
 /// @notice 500-piece ERC-721 collection minted by permanently burning BMC through `burnFrom`.
@@ -17,26 +18,27 @@ import {StandardArt} from "./StandardArt.sol";
 ///  Phase 1 (token ids 1-40): sequential Genesis mints at 1,000,000 BMC each. Token #1 is the
 ///  Legendary Genesis. Token id N receives artwork genesis-NN.png for N in 1..40.
 ///
-///  Phase 2 (token ids 41-500): 460 mystery mints at 350,000 BMC each. Each mystery mint burns BMC,
-///  immediately mints a pending-reveal NFT and requests one Chainlink VRF v2.5 random word. When the
-///  coordinator delivers the word it is stored; reveals are then finalized permissionlessly, in
-///  strict mint order, drawing without replacement from a fixed pool of 37 Genesis (genesis-41 ..
-///  genesis-77) and 423 Standard outcomes (fully on-chain SVG).
+///  Phase 2 (token ids 41-500): up to 460 mystery mints at 350,000 BMC each. A mystery mint burns BMC
+///  and mints a pending-reveal NFT. No randomness is requested per mint.
 ///
-///  Trust model / privileged powers (see README "Operational responsibilities"):
-///   - Owner can set the Genesis images CID exactly once, before any mint. No mint is possible
-///     until it is set. After that it is immutable.
-///   - Owner can update the Chainlink VRF request configuration (subscription id, key hash, callback
-///     gas, confirmations, payment mode). This can only affect *future* requests, never a stored or
-///     finalized outcome. The coordinator address is immutable. The owner cannot mint, reroll, assign
-///     artwork, change prices or metadata, withdraw anything, or upgrade the contract.
-///   - The VRF subscription itself is administered on the Chainlink coordinator by its subscription
-///     owner (adding this contract as a consumer, funding it). Anyone can fund a subscription.
+///  Single seed. Once the sale is closed (sold out, or `SALE_IDLE_TIMEOUT` without a mint after the
+///  Genesis phase), anyone may request ONE Chainlink VRF v2.5 random word. The first word the
+///  coordinator delivers for any request this contract made becomes the seed; every later delivery
+///  is ignored. All mystery outcomes are a pure function of the seed (`MysteryDraw`): token 41 + i is
+///  step i of a Fisher-Yates draw without replacement over 37 Genesis (genesis-41 .. genesis-77) and
+///  423 Standard (on-chain SVG) outcomes. Metadata is final in the same transaction that stores the
+///  seed; `finalizeReveals` only materializes outcomes into storage and emits `Revealed` events.
 ///
-///  Unavailable randomness: a pending NFT stays pending until the *original* VRF request is
-///  fulfilled by the coordinator. There is no reroll, no re-request and no fallback randomness.
-///  Chainlink VRF v2.5 requests remain pending while the subscription is unfunded and are fulfilled
-///  once it is funded again, which anyone may do.
+///  Recovery. If a request is not fulfilled within `SEED_REQUEST_TIMEOUT` (Chainlink drops underfunded
+///  requests after 24 hours), anyone may request again, from the configured subscription or from any
+///  subscription that lists this contract as a consumer, on any gas lane the coordinator has a proving
+///  key for. There is no reroll: a delivery after the seed is set changes nothing, and nothing lets the
+///  owner, a minter or a keeper choose, replace or preview the seed.
+///
+///  Trust model: the owner has no on-chain power beyond the `Ownable` role itself (useful for
+///  marketplace collection pages). The images CID, VRF coordinator, subscription id, gas lane and
+///  request parameters are fixed at construction. The VRF subscription is administered on the
+///  coordinator by its own owner (adding this contract as consumer, funding it with ETH).
 contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     using Strings for uint256;
 
@@ -45,7 +47,7 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     // ------------------------------------------------------------------------------------------
 
     enum Tier {
-        Pending, // 0: mystery mint awaiting reveal
+        Pending, // 0: mystery mint awaiting the seed
         LegendaryGenesis, // 1: token #1
         Genesis, // 2
         Standard // 3
@@ -53,18 +55,9 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
 
     enum RevealStatus {
         None, // not a mystery token / not minted
-        AwaitingRandomness, // VRF request open
-        RandomnessStored, // word delivered, waiting for in-order finalization
-        Revealed // tier and artwork assigned
-    }
-
-    struct VRFConfig {
-        uint256 subscriptionId;
-        bytes32 keyHash;
-        uint32 callbackGasLimit;
-        uint16 requestConfirmations;
-        bool nativePayment;
-        bool configured;
+        AwaitingRandomness, // seed not delivered yet
+        RandomnessStored, // seed delivered: outcome and metadata are final, not yet materialized
+        Revealed // outcome materialized in storage (`Revealed` event emitted)
     }
 
     // ------------------------------------------------------------------------------------------
@@ -85,18 +78,29 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     /// @dev 40 * 1,000,000 + 460 * 350,000 = 201,000,000 BMC.
     uint256 public constant MAX_TOTAL_BURN = 201_000_000 * 1e18;
 
-    uint32 public constant MIN_CALLBACK_GAS_LIMIT = 150_000;
-    uint32 public constant MAX_CALLBACK_GAS_LIMIT = 2_500_000;
-    uint16 public constant MIN_REQUEST_CONFIRMATIONS = 3;
-    uint16 public constant MAX_REQUEST_CONFIRMATIONS = 200;
-    /// @dev Maximum reveals processed from inside one VRF callback (bounded gas).
-    uint256 public constant CALLBACK_REVEAL_BATCH = 4;
-    /// @dev Conservative gas budget per reveal (measured ~85k worst case) and reserve for the return path.
-    uint256 public constant GAS_PER_REVEAL = 110_000;
-    uint256 public constant CALLBACK_GAS_RESERVE = 30_000;
+    /// @notice IPFS directory holding genesis-01.png .. genesis-77.png (CIDv1, verified against
+    ///         `artwork/genesis/` through a public gateway on 2026-10-12).
+    string public constant GENESIS_IMAGES_CID = "bafybeihfihwwpev4gkqjuqawgtptsv3ynzsokclo6odsolvoa65aqaac2u";
+
+    /// @notice After the Genesis phase, the sale closes once this long passes without any mint.
+    uint256 public constant SALE_IDLE_TIMEOUT = 30 days;
+    /// @notice A seed request that is still unfulfilled after this long may be re-requested by anyone.
+    ///         Longer than Chainlink's 24-hour pending window, so an honest node has dropped the old
+    ///         request before a new one is opened.
+    uint256 public constant SEED_REQUEST_TIMEOUT = 36 hours;
+
+    /// @dev Chainlink VRF v2.5, Ethereum mainnet: 500 gwei gas lane. Verified on 2026-10-12 against
+    ///      coordinator 0xD7f86b4b8Cae7D942340FF628F82735b7a20893a: s_provingKeyHashes(2) returns this
+    ///      hash and s_provingKeys(hash) returns (exists = true, maxGas = 500 gwei).
+    bytes32 public constant KEY_HASH = 0x3fd2fec10d06ee8f65e7f2e95f5c56511359ece3f33960ad8a866ae24a8ff10b;
+    uint32 public constant CALLBACK_GAS_LIMIT = 500_000;
+    uint16 public constant REQUEST_CONFIRMATIONS = 3;
+    bool public constant NATIVE_PAYMENT = true;
 
     IBMCToken public immutable BMC;
     IVRFCoordinatorV2Plus public immutable VRF_COORDINATOR;
+    /// @notice Chainlink VRF v2.5 subscription paying (in ETH) for the seed request.
+    uint256 public immutable SUBSCRIPTION_ID;
 
     // ------------------------------------------------------------------------------------------
     // Storage
@@ -106,55 +110,57 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     uint256 public totalMinted;
     /// @notice Total BMC (18-decimal units) burned through this contract.
     uint256 public totalBurned;
-    /// @notice Number of mystery tokens whose outcome has been finalized.
+    /// @notice Number of mystery tokens whose outcome has been materialized in storage.
     uint256 public revealedCount;
-    /// @notice Number of Genesis outcomes drawn from the mystery pool so far.
+    /// @notice Number of Genesis outcomes materialized from the mystery pool so far.
     uint256 public mysteryGenesisRevealed;
+    /// @notice Timestamp of the last mint of either phase.
+    uint64 public lastMintAt;
 
-    string public genesisImagesCID;
-    bool public genesisCIDLocked;
-
-    VRFConfig public vrfConfig;
+    /// @notice Timestamp of the latest seed request (0 if none yet).
+    uint64 public lastSeedRequestAt;
+    /// @notice Number of seed requests made so far (1 on the happy path).
+    uint32 public seedRequestCount;
+    /// @notice True once the seed is set.
+    bool public seedSet;
+    /// @notice The VRF word every mystery outcome derives from (meaningful only when `seedSet`).
+    uint256 public seed;
+    /// @notice The request whose word became the seed.
+    uint256 public seedRequestId;
+    /// @notice Requests made by this contract (any of them may deliver the seed; first delivery wins).
+    mapping(uint256 requestId => bool) public isSeedRequest;
 
     mapping(uint256 tokenId => Tier) private _tier;
     mapping(uint256 tokenId => uint16) private _artworkId;
-    mapping(uint256 tokenId => RevealStatus) private _revealStatus;
-    mapping(uint256 tokenId => uint256 requestId) public requestIdOf;
-    mapping(uint256 requestId => uint256 tokenId) public tokenIdOfRequest;
-    mapping(uint256 tokenId => uint256) private _randomWord;
 
-    /// @dev Virtual Fisher-Yates over 460 slots. slot(i) = i unless swapped; stores value + 1.
+    /// @dev Virtual Fisher-Yates over 460 slots for materialization. slot(i) = i unless swapped;
+    ///      stores value + 1. Mirrors `MysteryDraw.slotAt` step by step.
     mapping(uint256 => uint256) private _slotSwap;
 
     // ------------------------------------------------------------------------------------------
     // Events
     // ------------------------------------------------------------------------------------------
 
-    event GenesisImagesCIDSet(string cid);
-    event VRFConfigSet(
-        uint256 subscriptionId,
-        bytes32 keyHash,
-        uint32 callbackGasLimit,
-        uint16 requestConfirmations,
-        bool nativePayment
-    );
     event GenesisMinted(address indexed minter, uint256 indexed tokenId, uint16 artworkId, uint256 bmcBurned);
-    event MysteryMinted(address indexed minter, uint256 indexed tokenId, uint256 indexed requestId, uint256 bmcBurned);
-    event RandomnessStored(uint256 indexed tokenId, uint256 indexed requestId, uint256 randomWord);
+    event MysteryMinted(address indexed minter, uint256 indexed tokenId, uint256 bmcBurned);
+    event SeedRequested(uint256 indexed requestId, uint32 attempt, uint256 subscriptionId, bytes32 keyHash);
+    event SeedDelivered(uint256 indexed requestId, uint256 seed);
+    event SeedDeliveryIgnored(uint256 indexed requestId, uint256 randomWord);
     event Revealed(uint256 indexed tokenId, Tier tier, uint16 artworkId);
 
     // ------------------------------------------------------------------------------------------
     // Errors
     // ------------------------------------------------------------------------------------------
 
-    error GenesisCIDNotSet();
-    error GenesisCIDAlreadySet();
-    error EmptyCID();
-    error VRFNotConfigured();
-    error InvalidVRFConfig();
     error GenesisPhaseOver();
     error GenesisPhaseNotOver();
     error SoldOut();
+    error SaleIsClosed();
+    error SaleNotClosed();
+    error NothingToReveal();
+    error SeedAlreadyDelivered();
+    error SeedRequestPending(uint256 retryAt);
+    error KeyHashNotRegistered(bytes32 keyHash);
     error UnexpectedTokenDecimals(uint8 actual);
     error BurnMismatch(uint256 expected, uint256 actual);
     error OnlyCoordinator();
@@ -166,54 +172,20 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     // Constructor
     // ------------------------------------------------------------------------------------------
 
-    /// @param initialOwner Owner able to set the images CID (once) and the VRF request config.
+    /// @param initialOwner Collection owner. Has no on-chain power beyond the role itself.
     /// @param bmcToken The BMC token (mainnet 0x38224239f2BDae357D47cb864BC533d7f72dF961).
     /// @param vrfCoordinator Chainlink VRF v2.5 coordinator (mainnet 0xD7f86b4b8Cae7D942340FF628F82735b7a20893a).
-    constructor(address initialOwner, address bmcToken, address vrfCoordinator)
+    /// @param subscriptionId VRF v2.5 subscription this contract must be a consumer of, funded with ETH.
+    /// @dev Makes no external call: the launch rehearses constructors on an empty chain. Token and
+    ///      coordinator behaviour is checked on first use instead.
+    constructor(address initialOwner, address bmcToken, address vrfCoordinator, uint256 subscriptionId)
         ERC721("BMC Illuminati Pass", "BMCPASS")
         Ownable(initialOwner)
     {
-        require(bmcToken != address(0) && vrfCoordinator != address(0), "zero address");
+        require(bmcToken != address(0) && vrfCoordinator != address(0) && subscriptionId != 0, "zero argument");
         BMC = IBMCToken(bmcToken);
         VRF_COORDINATOR = IVRFCoordinatorV2Plus(vrfCoordinator);
-    }
-
-    // ------------------------------------------------------------------------------------------
-    // Owner configuration (disclosed operational permissions)
-    // ------------------------------------------------------------------------------------------
-
-    /// @notice Set the IPFS directory CID holding genesis-01.png .. genesis-77.png. Callable once.
-    function setGenesisImagesCID(string calldata cid) external onlyOwner {
-        if (genesisCIDLocked) revert GenesisCIDAlreadySet();
-        if (bytes(cid).length == 0) revert EmptyCID();
-        genesisImagesCID = cid;
-        genesisCIDLocked = true;
-        emit GenesisImagesCIDSet(cid);
-    }
-
-    /// @notice Set the Chainlink VRF v2.5 request parameters used for future mystery mints.
-    /// @dev Only affects requests made after this call. Cannot touch stored randomness or reveals.
-    function setVRFConfig(
-        uint256 subscriptionId,
-        bytes32 keyHash,
-        uint32 callbackGasLimit,
-        uint16 requestConfirmations,
-        bool nativePayment
-    ) external onlyOwner {
-        if (
-            subscriptionId == 0 || keyHash == bytes32(0) || callbackGasLimit < MIN_CALLBACK_GAS_LIMIT
-                || callbackGasLimit > MAX_CALLBACK_GAS_LIMIT || requestConfirmations < MIN_REQUEST_CONFIRMATIONS
-                || requestConfirmations > MAX_REQUEST_CONFIRMATIONS
-        ) revert InvalidVRFConfig();
-        vrfConfig = VRFConfig({
-            subscriptionId: subscriptionId,
-            keyHash: keyHash,
-            callbackGasLimit: callbackGasLimit,
-            requestConfirmations: requestConfirmations,
-            nativePayment: nativePayment,
-            configured: true
-        });
-        emit VRFConfigSet(subscriptionId, keyHash, callbackGasLimit, requestConfirmations, nativePayment);
+        SUBSCRIPTION_ID = subscriptionId;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -222,12 +194,12 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
 
     /// @notice Phase 1: mint the next sequential Genesis NFT (ids 1-40) for 1,000,000 BMC.
     function mintGenesis() external nonReentrant returns (uint256 tokenId) {
-        if (!genesisCIDLocked) revert GenesisCIDNotSet();
         if (totalMinted >= GENESIS_PHASE_SUPPLY) revert GenesisPhaseOver();
 
         _burnExact(msg.sender, GENESIS_PRICE);
 
         tokenId = ++totalMinted;
+        lastMintAt = uint64(block.timestamp);
         Tier tier = tokenId == 1 ? Tier.LegendaryGenesis : Tier.Genesis;
         _tier[tokenId] = tier;
         _artworkId[tokenId] = uint16(tokenId);
@@ -237,33 +209,17 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
         _safeMint(msg.sender, tokenId);
     }
 
-    /// @notice Phase 2: burn 350,000 BMC, receive a pending-reveal NFT and open a VRF request.
-    function mintMystery() external nonReentrant returns (uint256 tokenId, uint256 requestId) {
-        if (!genesisCIDLocked) revert GenesisCIDNotSet();
+    /// @notice Phase 2: burn 350,000 BMC and receive a pending-reveal NFT. No VRF request is made.
+    function mintMystery() external nonReentrant returns (uint256 tokenId) {
         if (totalMinted < GENESIS_PHASE_SUPPLY) revert GenesisPhaseNotOver();
         if (totalMinted >= MAX_SUPPLY) revert SoldOut();
-        VRFConfig memory cfg = vrfConfig;
-        if (!cfg.configured) revert VRFNotConfigured();
+        if (saleClosed()) revert SaleIsClosed();
 
         _burnExact(msg.sender, MYSTERY_PRICE);
 
         tokenId = ++totalMinted;
-        _revealStatus[tokenId] = RevealStatus.AwaitingRandomness;
-
-        requestId = VRF_COORDINATOR.requestRandomWords(
-            VRFV2PlusClient.RandomWordsRequest({
-                keyHash: cfg.keyHash,
-                subId: cfg.subscriptionId,
-                requestConfirmations: cfg.requestConfirmations,
-                callbackGasLimit: cfg.callbackGasLimit,
-                numWords: 1,
-                extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: cfg.nativePayment}))
-            })
-        );
-        require(tokenIdOfRequest[requestId] == 0, "duplicate request id");
-        requestIdOf[tokenId] = requestId;
-        tokenIdOfRequest[requestId] = tokenId;
-        emit MysteryMinted(msg.sender, tokenId, requestId, MYSTERY_PRICE);
+        lastMintAt = uint64(block.timestamp);
+        emit MysteryMinted(msg.sender, tokenId, MYSTERY_PRICE);
 
         _safeMint(msg.sender, tokenId);
     }
@@ -283,42 +239,105 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     }
 
     // ------------------------------------------------------------------------------------------
+    // Sale close and seed request (permissionless)
+    // ------------------------------------------------------------------------------------------
+
+    /// @notice The sale is closed when sold out, or when `SALE_IDLE_TIMEOUT` has passed without a mint
+    ///         after the Genesis phase. Closing is a pure function of state; no call is needed.
+    function saleClosed() public view returns (bool) {
+        if (totalMinted >= MAX_SUPPLY) return true;
+        return totalMinted >= GENESIS_PHASE_SUPPLY && block.timestamp >= uint256(lastMintAt) + SALE_IDLE_TIMEOUT;
+    }
+
+    /// @notice Request the single VRF seed from the configured subscription and gas lane. Anyone may
+    ///         call once the sale is closed; again after `SEED_REQUEST_TIMEOUT` if nothing arrived.
+    function requestSeed() external returns (uint256 requestId) {
+        return _requestSeed(SUBSCRIPTION_ID, KEY_HASH, false);
+    }
+
+    /// @notice Recovery: same as `requestSeed`, but from any subscription that lists this contract as a
+    ///         consumer and on any gas lane the coordinator has a proving key for. Lets anyone pay for
+    ///         the seed if the configured subscription or lane is unusable. Same timeout rules apply.
+    function requestSeedWith(uint256 subscriptionId, bytes32 keyHash) external returns (uint256 requestId) {
+        return _requestSeed(subscriptionId, keyHash, true);
+    }
+
+    function _requestSeed(uint256 subscriptionId, bytes32 keyHash, bool strictRegistry)
+        private
+        nonReentrant
+        returns (uint256 requestId)
+    {
+        if (!saleClosed()) revert SaleNotClosed();
+        if (totalMinted <= GENESIS_PHASE_SUPPLY) revert NothingToReveal();
+        if (seedSet) revert SeedAlreadyDelivered();
+        uint256 retryAt = uint256(lastSeedRequestAt) + SEED_REQUEST_TIMEOUT;
+        if (lastSeedRequestAt != 0 && block.timestamp < retryAt) revert SeedRequestPending(retryAt);
+        _checkKeyHash(keyHash, strictRegistry);
+
+        requestId = VRF_COORDINATOR.requestRandomWords(
+            VRFV2PlusClient.RandomWordsRequest({
+                keyHash: keyHash,
+                subId: subscriptionId,
+                requestConfirmations: REQUEST_CONFIRMATIONS,
+                callbackGasLimit: CALLBACK_GAS_LIMIT,
+                numWords: 1,
+                extraArgs: VRFV2PlusClient._argsToBytes(VRFV2PlusClient.ExtraArgsV1({nativePayment: NATIVE_PAYMENT}))
+            })
+        );
+        require(requestId != 0 && !isSeedRequest[requestId], "duplicate request id");
+        isSeedRequest[requestId] = true;
+        lastSeedRequestAt = uint64(block.timestamp);
+        uint32 attempt = ++seedRequestCount;
+        emit SeedRequested(requestId, attempt, subscriptionId, keyHash);
+    }
+
+    /// @dev The mainnet coordinator does not validate key hashes in `requestRandomWords`; a request on
+    ///      an unregistered lane is accepted and never fulfilled. Read its proving-key registry
+    ///      (`s_provingKeys(bytes32) -> (bool exists, uint64 maxGas)`) before requesting. If the
+    ///      coordinator does not expose the registry (test mocks), the default lane is accepted and the
+    ///      recovery path is refused.
+    function _checkKeyHash(bytes32 keyHash, bool strict) private view {
+        (bool ok, bytes memory data) =
+            address(VRF_COORDINATOR).staticcall(abi.encodeWithSignature("s_provingKeys(bytes32)", keyHash));
+        bool known = ok && data.length >= 64;
+        if (known) {
+            (bool exists,) = abi.decode(data, (bool, uint64));
+            if (!exists) revert KeyHashNotRegistered(keyHash);
+        } else if (strict || keyHash != KEY_HASH) {
+            revert KeyHashNotRegistered(keyHash);
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Chainlink VRF v2.5 fulfillment
     // ------------------------------------------------------------------------------------------
 
-    /// @notice Called by the VRF coordinator. Stores the random word for the mapped token and then
-    ///         attempts a bounded, best-effort batch of in-order reveals.
-    /// @dev Same signature as Chainlink's VRFConsumerBaseV2Plus so the coordinator can call it.
+    /// @notice Called by the VRF coordinator. The first word delivered for any request this contract
+    ///         made becomes the seed; later deliveries are ignored. Nothing else happens here, so the
+    ///         callback cannot run out of gas or fail for a reason outside this function.
+    /// @dev Same signature as Chainlink's VRFConsumerBaseV2Plus so the coordinator can call it. Not
+    ///      inherited: that base would give the owner `setCoordinator`.
     function rawFulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) external {
         if (msg.sender != address(VRF_COORDINATOR)) revert OnlyCoordinator();
-        uint256 tokenId = tokenIdOfRequest[requestId];
-        if (tokenId == 0) revert UnknownRequest(requestId);
+        if (!isSeedRequest[requestId]) revert UnknownRequest(requestId);
         if (randomWords.length == 0) revert NoRandomWords();
-        // Idempotent: a repeated delivery for an already-stored request is ignored.
-        if (_revealStatus[tokenId] != RevealStatus.AwaitingRandomness) return;
-
-        _randomWord[tokenId] = randomWords[0];
-        _revealStatus[tokenId] = RevealStatus.RandomnessStored;
-        emit RandomnessStored(tokenId, requestId, randomWords[0]);
-
-        // Best effort, gas-aware: only attempt as many in-order reveals as the remaining callback gas
-        // can pay for, so the coordinator never records a failed callback. If the attempt still fails
-        // the stored word stays intact for permissionless finalization via finalizeReveals().
-        uint256 gasAvailable = gasleft();
-        if (gasAvailable <= CALLBACK_GAS_RESERVE) return;
-        uint256 batch = (gasAvailable - CALLBACK_GAS_RESERVE) / GAS_PER_REVEAL;
-        if (batch == 0) return;
-        if (batch > CALLBACK_REVEAL_BATCH) batch = CALLBACK_REVEAL_BATCH;
-        try this.finalizeReveals(batch) {} catch {}
+        if (seedSet) {
+            emit SeedDeliveryIgnored(requestId, randomWords[0]);
+            return;
+        }
+        seedSet = true;
+        seed = randomWords[0];
+        seedRequestId = requestId;
+        emit SeedDelivered(requestId, randomWords[0]);
     }
 
-    /// @notice Permissionless: finalize up to `maxCount` pending tokens whose randomness is stored,
-    ///         in strict mint order (token 41, 42, ...). Returns how many were revealed.
-    /// @dev Processing in mint order means nobody (minter, keeper, owner) can influence an outcome by
-    ///      choosing the finalization order of concurrently pending tokens.
+    /// @notice Permissionless: materialize up to `maxCount` outcomes into storage, in mint order,
+    ///         emitting `Revealed`. Outcomes and metadata are already final once the seed is set; this
+    ///         only makes views O(1) and feeds indexers. Returns how many were materialized.
     function finalizeReveals(uint256 maxCount) external returns (uint256 done) {
+        if (!seedSet) return 0;
         uint256 tokenId = GENESIS_PHASE_SUPPLY + revealedCount + 1;
-        while (done < maxCount && tokenId <= totalMinted && _revealStatus[tokenId] == RevealStatus.RandomnessStored) {
+        while (done < maxCount && tokenId <= totalMinted) {
             _finalize(tokenId);
             unchecked {
                 ++tokenId;
@@ -327,31 +346,20 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
         }
     }
 
-    /// @dev Draw one outcome without replacement using a virtual Fisher-Yates shuffle (O(1) gas).
+    /// @dev One step of the virtual Fisher-Yates shuffle in storage (O(1) gas), identical to
+    ///      `MysteryDraw.slotAt(seed, revealedCount)`.
     function _finalize(uint256 tokenId) private {
-        uint256 remaining = MYSTERY_SUPPLY - revealedCount;
-        uint256 word = _randomWord[tokenId];
-        uint256 r = uint256(keccak256(abi.encode(word, tokenId))) % remaining;
-
+        uint256 step = revealedCount;
+        uint256 r = MysteryDraw.pick(seed, step);
+        uint256 lastIndex = MYSTERY_SUPPLY - 1 - step;
         uint256 picked = _slotValue(r);
-        uint256 last = _slotValue(remaining - 1);
-        _slotSwap[r] = last + 1;
-        delete _slotSwap[remaining - 1];
+        _slotSwap[r] = _slotValue(lastIndex) + 1;
+        delete _slotSwap[lastIndex];
+        revealedCount = step + 1;
 
-        revealedCount += 1;
-        _revealStatus[tokenId] = RevealStatus.Revealed;
-        delete _randomWord[tokenId];
-
-        Tier tier;
-        uint16 artwork;
-        if (picked < MYSTERY_GENESIS) {
-            tier = Tier.Genesis;
-            artwork = uint16(GENESIS_PHASE_SUPPLY + 1 + picked); // genesis-41 .. genesis-77
-            mysteryGenesisRevealed += 1;
-        } else {
-            tier = Tier.Standard;
-            artwork = uint16(picked - MYSTERY_GENESIS + 1); // standard 1 .. 423
-        }
+        (bool genesis, uint16 artwork) = MysteryDraw.decode(picked);
+        Tier tier = genesis ? Tier.Genesis : Tier.Standard;
+        if (genesis) mysteryGenesisRevealed += 1;
         _tier[tokenId] = tier;
         _artworkId[tokenId] = artwork;
         emit Revealed(tokenId, tier, artwork);
@@ -366,22 +374,47 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     // Views
     // ------------------------------------------------------------------------------------------
 
-    function tierOf(uint256 tokenId) external view returns (Tier) {
+    /// @dev Tier and artwork of any minted token: stored for Genesis-phase and materialized tokens,
+    ///      derived from the seed for the rest, Pending before the seed.
+    function _outcome(uint256 tokenId) private view returns (Tier tier, uint16 artwork) {
+        tier = _tier[tokenId];
+        if (tier != Tier.Pending) return (tier, _artworkId[tokenId]);
+        if (!seedSet) return (Tier.Pending, 0);
+        (bool genesis, uint16 art) = MysteryDraw.decode(MysteryDraw.slotAt(seed, tokenId - GENESIS_PHASE_SUPPLY - 1));
+        return (genesis ? Tier.Genesis : Tier.Standard, art);
+    }
+
+    function tierOf(uint256 tokenId) external view returns (Tier tier) {
         _requireMinted(tokenId);
-        return _tier[tokenId];
+        (tier,) = _outcome(tokenId);
     }
 
     /// @notice Artwork identifier: for Genesis tiers the genesis-NN number (1..77); for Standard the
     ///         on-chain artwork index (1..423); 0 while pending.
-    function artworkIdOf(uint256 tokenId) external view returns (uint16) {
+    function artworkIdOf(uint256 tokenId) external view returns (uint16 artwork) {
         _requireMinted(tokenId);
-        return _artworkId[tokenId];
+        (, artwork) = _outcome(tokenId);
     }
 
     function revealStatusOf(uint256 tokenId) external view returns (RevealStatus) {
         _requireMinted(tokenId);
-        if (tokenId <= GENESIS_PHASE_SUPPLY) return RevealStatus.Revealed;
-        return _revealStatus[tokenId];
+        if (tokenId <= GENESIS_PHASE_SUPPLY || _tier[tokenId] != Tier.Pending) return RevealStatus.Revealed;
+        return seedSet ? RevealStatus.RandomnessStored : RevealStatus.AwaitingRandomness;
+    }
+
+    /// @notice Kept for the mint site: the images directory is a constant now.
+    function genesisImagesCID() external pure returns (string memory) {
+        return GENESIS_IMAGES_CID;
+    }
+
+    /// @notice Earliest time at which `requestSeed` can be called (0 when it cannot be predicted yet,
+    ///         i.e. the sale is open and not sold out).
+    function seedRequestAvailableAt() external view returns (uint256) {
+        if (seedSet) return 0;
+        if (lastSeedRequestAt != 0) return uint256(lastSeedRequestAt) + SEED_REQUEST_TIMEOUT;
+        if (totalMinted >= MAX_SUPPLY) return block.timestamp;
+        if (totalMinted >= GENESIS_PHASE_SUPPLY) return uint256(lastMintAt) + SALE_IDLE_TIMEOUT;
+        return 0;
     }
 
     function totalSupply() external view returns (uint256) {
@@ -396,12 +429,13 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
         return totalMinted < GENESIS_PHASE_SUPPLY;
     }
 
-    /// @notice Mystery mint positions not yet sold.
+    /// @notice Mystery mint positions not yet sold (0 once the sale is closed).
     function remainingMysteryMints() external view returns (uint256) {
-        return totalMinted < GENESIS_PHASE_SUPPLY ? MYSTERY_SUPPLY : MAX_SUPPLY - totalMinted;
+        if (totalMinted < GENESIS_PHASE_SUPPLY) return MYSTERY_SUPPLY;
+        return saleClosed() ? 0 : MAX_SUPPLY - totalMinted;
     }
 
-    /// @notice Mystery mints sold but not yet revealed.
+    /// @notice Mystery mints sold whose outcome is not yet materialized.
     function pendingReveals() external view returns (uint256) {
         return totalMinted < GENESIS_PHASE_SUPPLY ? 0 : (totalMinted - GENESIS_PHASE_SUPPLY) - revealedCount;
     }
@@ -415,10 +449,10 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
         return TOTAL_STANDARD - (revealedCount - mysteryGenesisRevealed);
     }
 
-    /// @notice Current price of the next mint in BMC units, 0 when sold out.
+    /// @notice Current price of the next mint in BMC units, 0 when sold out or closed.
     function currentPrice() external view returns (uint256) {
-        if (totalMinted >= MAX_SUPPLY) return 0;
-        return totalMinted < GENESIS_PHASE_SUPPLY ? GENESIS_PRICE : MYSTERY_PRICE;
+        if (totalMinted < GENESIS_PHASE_SUPPLY) return GENESIS_PRICE;
+        return saleClosed() ? 0 : MYSTERY_PRICE;
     }
 
     function _requireMinted(uint256 tokenId) private view {
@@ -431,14 +465,14 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
 
     function tokenURI(uint256 tokenId) public view override returns (string memory) {
         _requireMinted(tokenId);
-        Tier tier = _tier[tokenId];
+        (Tier tier, uint16 artwork) = _outcome(tokenId);
         string memory json;
         if (tier == Tier.Pending) {
             json = _pendingJson(tokenId);
         } else if (tier == Tier.Standard) {
-            json = _standardJson(tokenId, _artworkId[tokenId]);
+            json = _standardJson(tokenId, artwork);
         } else {
-            json = _genesisJson(tokenId, tier, _artworkId[tokenId]);
+            json = _genesisJson(tokenId, tier, artwork);
         }
         return string.concat("data:application/json;base64,", Base64.encode(bytes(json)));
     }
@@ -446,15 +480,16 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
     /// @notice Raw SVG of a Standard token (reverts for other tiers).
     function standardSVG(uint256 tokenId) external view returns (string memory) {
         _requireMinted(tokenId);
-        require(_tier[tokenId] == Tier.Standard, "not standard");
-        return StandardArt.render(_artworkId[tokenId]);
+        (Tier tier, uint16 artwork) = _outcome(tokenId);
+        require(tier == Tier.Standard, "not standard");
+        return StandardArt.render(artwork);
     }
 
     function _genesisFile(uint16 artwork) private pure returns (string memory) {
         return string.concat("genesis-", artwork < 10 ? "0" : "", uint256(artwork).toString(), ".png");
     }
 
-    function _genesisJson(uint256 tokenId, Tier tier, uint16 artwork) private view returns (string memory) {
+    function _genesisJson(uint256 tokenId, Tier tier, uint16 artwork) private pure returns (string memory) {
         bool legendary = tier == Tier.LegendaryGenesis;
         string memory file = _genesisFile(artwork);
         string memory head = string.concat(
@@ -466,7 +501,7 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
                 ? "The one. The first BMC Illuminati Pass ever minted: the Legendary Genesis, the rarest piece of the 500-piece collection. A mysterious hooded frog with a glowing golden third eye, crowned and veiled, beneath the floating golden eye-in-triangle. Minted by permanently burning 1,000,000 BMC."
                 : "A Genesis BMC Illuminati Pass. A mysterious cartoon frog in a black hooded cloak with premium gold-and-black styling, a glowing golden third eye and a floating golden eye-in-triangle. One of 77 Genesis pieces in a 500-piece collection minted by permanently burning BMC.",
             '","image":"ipfs://',
-            genesisImagesCID,
+            GENESIS_IMAGES_CID,
             "/",
             file
         );
@@ -506,7 +541,7 @@ contract BMCIlluminatiPass is ERC721, Ownable, ReentrancyGuard {
         return string.concat(
             '{"name":"BMC Illuminati Pass #',
             tokenId.toString(),
-            ' - Pending Reveal","description":"A BMC Illuminati Pass mystery mint awaiting Chainlink VRF randomness. The outcome (Genesis or Standard) is not yet determined on-chain. Metadata becomes permanent once revealed.","image":"data:image/svg+xml;base64,',
+            ' - Pending Reveal","description":"A BMC Illuminati Pass mystery mint awaiting the Chainlink VRF seed requested once the sale closes. The outcome (Genesis or Standard) is not yet determined on-chain. Metadata becomes permanent once the seed is delivered.","image":"data:image/svg+xml;base64,',
             Base64.encode(bytes(svg)),
             '","attributes":[{"trait_type":"Tier","value":"Pending Reveal"}]}'
         );

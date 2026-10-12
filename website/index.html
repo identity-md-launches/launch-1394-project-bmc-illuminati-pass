@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bmc-pass — BMC Illuminati Pass mint</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="sigil">&#9651;</span>
+    <div><h1>BMC Illuminati Pass</h1><small>500 passes. Minted by burning BMC. Ethereum mainnet.</small></div>
+  </div>
+  <div class="wallet">
+    <span id="network" class="pill">not connected</span>
+    <button id="connect" class="btn">Connect MetaMask / Rabby</button>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="hero-art">
+      <img id="legendary" src="../artwork/genesis/genesis-01.png" alt="Genesis #1, the Legendary Genesis">
+      <div class="caption">Genesis #1 — Legendary Genesis. Guaranteed to the first successful minter. The rarest piece of the collection.</div>
+    </div>
+    <div class="hero-stats">
+      <div class="stat"><span>Current phase</span><strong id="phase">—</strong></div>
+      <div class="stat"><span>Current mint price</span><strong id="price">—</strong></div>
+      <div class="stat"><span>Minted / supply</span><strong id="supply">— / 500</strong></div>
+      <div class="stat"><span>Total BMC burned</span><strong id="burned">—</strong></div>
+      <div class="stat"><span>Your BMC balance</span><strong id="balance">—</strong></div>
+      <div class="stat"><span>Your BMC allowance to the pass</span><strong id="allowance">—</strong></div>
+    </div>
+  </section>
+
+  <section class="mint">
+    <div class="card" id="genesis-card">
+      <h2>Phase 1 · Genesis mint</h2>
+      <p>First 40 mints. 1,000,000 BMC each, permanently burned. Token #N receives genesis-NN.png in strict order. Mint #1 is the Legendary Genesis.</p>
+      <div class="row">
+        <button id="approve-genesis" class="btn ghost">1. Approve 1,000,000 BMC</button>
+        <button id="mint-genesis" class="btn">2. Mint Genesis</button>
+      </div>
+      <p class="hint" id="genesis-left">—</p>
+    </div>
+    <div class="card" id="mystery-card">
+      <h2>Phase 2 · Mystery mint</h2>
+      <p>Remaining 460 mints. 350,000 BMC each, permanently burned. You receive a pending-reveal NFT immediately; Chainlink VRF then decides Genesis (41–77) or Standard (on-chain SVG).</p>
+      <div class="row">
+        <button id="approve-mystery" class="btn ghost">1. Approve 350,000 BMC</button>
+        <button id="mint-mystery" class="btn">2. Mystery Mint</button>
+      </div>
+      <div class="odds" id="odds">—</div>
+    </div>
+  </section>
+
+  <section class="card" id="status-card">
+    <h2>Transactions &amp; reveals</h2>
+    <ul id="txlog" class="txlog"><li class="muted">No transactions yet.</li></ul>
+    <div class="row">
+      <input id="lookup-id" type="number" min="1" max="500" placeholder="Token id">
+      <button id="lookup" class="btn ghost">Check reveal status</button>
+      <button id="finalize" class="btn ghost">Finalize stored reveals (anyone)</button>
+    </div>
+    <p id="lookup-result" class="hint"></p>
+  </section>
+
+  <section class="card">
+    <h2>How it works, honestly</h2>
+    <ul class="faq">
+      <li><strong>Gas.</strong> Every approve and mint is an Ethereum transaction. You pay ETH gas on top of the BMC price. The BMC price is fixed in the contract; gas is set by the network and your wallet.</li>
+      <li><strong>Burning.</strong> The contract calls BMC <code>burnFrom</code> on your exact approval. Burned BMC is destroyed, not sent anywhere. Nothing is burned when you transfer a pass later.</li>
+      <li><strong>VRF reveal delay.</strong> A mystery mint opens a Chainlink VRF v2.5 request. Chainlink answers after the configured block confirmations (usually a few minutes). Until then your NFT shows neutral pending metadata. Reveals are finalized in mint order, so a reveal can also wait for the mints just before it.</li>
+      <li><strong>No rerolls.</strong> Nobody, including the team, can reroll, pick artwork, change prices or metadata, mint for free, or withdraw anything. The only team powers are setting the Genesis image CID once and updating the VRF request settings for future requests.</li>
+      <li><strong>If randomness is late.</strong> A request stays pending until Chainlink fulfils it. If the VRF subscription runs dry, anyone can fund it and pending requests complete. There is no fallback randomness.</li>
+      <li><strong>Odds.</strong> Shown from the remaining on-chain inventory. While reveals are outstanding the odds are provisional, because pending tokens already own outcomes that have not been drawn yet.</li>
+    </ul>
+  </section>
+
+  <section class="card">
+    <h2>Preview gallery</h2>
+    <p class="hint">Genesis artworks are served from IPFS once the directory CID is set. Standard passes are generated fully on-chain as SVG, 423 unique combinations of 6 backgrounds, 5 cloaks, 6 eyes, 5 symbols and 6 accessories.</p>
+    <div class="gallery" id="gallery"></div>
+  </section>
+</main>
+
+<footer>
+  <span>Contract: <a id="contract-link" href="#" target="_blank" rel="noopener">not configured</a></span>
+  <span>BMC token: <a id="bmc-link" href="#" target="_blank" rel="noopener">0x3822…F961</a></span>
+</footer>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
